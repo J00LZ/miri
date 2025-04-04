@@ -533,6 +533,8 @@ fn main() {
         } else if arg == "-Zmiri-tree-borrows" {
             miri_config.borrow_tracker = Some(BorrowTrackerMethod::TreeBorrows);
             miri_config.provenance_mode = ProvenanceMode::Strict;
+        } else if arg == "-Zmiri-julius-borrows" {
+            miri_config.borrow_tracker = Some(BorrowTrackerMethod::JuliusBorrows);
         } else if arg == "-Zmiri-unique-is-unique" {
             miri_config.unique_is_unique = true;
         } else if arg == "-Zmiri-disable-data-race-detector" {
