@@ -2,10 +2,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use rustc_abi::Size;
-use rustc_const_eval::interpret::{AllocId, AllocRange, InterpResult, interp_ok};
+use rustc_const_eval::interpret::{interp_ok, AllocId, AllocKind, AllocRange, InterpResult};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::mir::RetagKind;
-use stacked::BasicStackCheckerBuilder;
+use tracing::trace;
+use self::stacked::BasicStackCheckerBuilder;
 
 use super::{BorTag, GlobalState, GlobalStateInner};
 use crate::{
@@ -26,6 +27,7 @@ pub trait CheckerBuilder {
     ) -> Self::Checker;
 }
 
+#[allow(unused_variables)]
 pub trait Checker: std::fmt::Debug {
     fn check_access<'ecx, 'tcx>(
         &mut self,
@@ -235,7 +237,7 @@ impl<'tcx> Custom {
 }
 
 impl VisitProvenance for Custom {
-    fn visit_provenance(&self, visit: &mut crate::VisitWith<'_>) {
+    fn visit_provenance(&self, _visit: &mut crate::VisitWith<'_>) {
         // todo
     }
 }
@@ -260,8 +262,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     fn jb_protect_place(&mut self, place: &MPlaceTy<'tcx>) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
         let this = self.eval_context_mut();
-        let (id, s, x) = this.ptr_get_alloc_id(place.ptr(), 0)?;
         return interp_ok(place.clone());
+        let (id, s, x) = this.ptr_get_alloc_id(place.ptr(), 0)?;
         let extra = this.get_alloc_extra(id)?;
         let cell = extra.borrow_tracker_jb();
         let mut borrow_tracker = cell.borrow_mut();
@@ -270,11 +272,26 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     fn jb_expose_tag(&self, alloc_id: AllocId, tag: BorTag) -> InterpResult<'tcx> {
         let this = self.eval_context_ref();
-        return interp_ok(());
-        let extra = this.get_alloc_extra(alloc_id)?;
-        let cell = extra.borrow_tracker_jb();
-        let mut borrow_tracker = cell.borrow_mut();
-        borrow_tracker.expose_tag(tag)
+
+        // Function pointers and dead objects don't have an alloc_extra so we ignore them.
+        // This is okay because accessing them is UB anyway, no need for any Tree Borrows checks.
+        // NOT using `get_alloc_extra_mut` since this might be a read-only allocation!
+        let kind = this.get_alloc_info(alloc_id).kind;
+        match kind {
+            AllocKind::LiveData => {
+                // This should have alloc_extra data, but `get_alloc_extra` can still fail
+                // if converting this alloc_id from a global to a local one
+                // uncovers a non-supported `extern static`.
+                let alloc_extra = this.get_alloc_extra(alloc_id)?;
+                trace!("Custom Borrows tag {tag:?} exposed in {alloc_id:?}");
+                alloc_extra.borrow_tracker_tb().borrow_mut().expose_tag(tag);
+            }
+            AllocKind::Function | AllocKind::VTable | AllocKind::Dead => {
+                // No need to do anything, we don't track these.
+                trace!("Custom Borrows tag {tag:?} not exposed in {alloc_id:?} (no tracking)");
+            }
+        }
+        interp_ok(())
     }
 
     fn jb_give_pointer_debug_name(
