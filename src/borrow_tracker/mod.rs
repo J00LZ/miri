@@ -233,7 +233,58 @@ pub enum BorrowTrackerMethod {
     /// Tree borrows, as implemented in borrow_tracker/tree_borrows
     TreeBorrows,
 
-    JuliusBorrows,
+    JuliusBorrows(JuliusBorrowsFields),
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct JuliusBorrowsFields {
+    track_mutability: bool,
+}
+
+impl Default for JuliusBorrowsFields {
+    fn default() -> Self {
+        Self { track_mutability: true }
+    }
+}
+
+impl JuliusBorrowsFields {
+    pub fn from_args(data: &str) -> Self {
+        let mut fields = Self::default();
+
+        for arg in data.split(',') {
+            let arg = arg.trim();
+            if arg.is_empty() {
+                continue;
+            }
+            if let Some((key,value)) = arg.split_once('=') {
+                match key.trim() {
+                    "track_mutability" => {
+                        fields.track_mutability = value.trim() == "true";
+                    }
+                    _ => {
+                        panic!("Unknown argument for Julius Borrows: {}", key);
+                    }
+                }
+            } else {
+                match arg {
+                    "off" => {
+                        fields.track_mutability = false;
+                    }
+                    "on" => {
+                        fields.track_mutability = true;
+                    }
+                    "track_mutability" => {
+                        fields.track_mutability = true;
+                    }
+                    _ => {
+                        panic!("Unknown argument for Julius Borrows: {}", arg);
+                    }
+                }
+            }
+        }
+
+        fields
+    }
 }
 
 impl BorrowTrackerMethod {
@@ -264,9 +315,11 @@ impl GlobalStateInner {
                 AllocState::TreeBorrows(Box::new(RefCell::new(Tree::new_allocation(
                     id, alloc_size, self, kind, machine,
                 )))),
-            BorrowTrackerMethod::JuliusBorrows =>
+            BorrowTrackerMethod::JuliusBorrows(fields) =>
                 AllocState::JuliusBorrows(Box::new(RefCell::new(
-                    julius_borrows::Custom::new_allocation(id, alloc_size, self, kind, machine),
+                    julius_borrows::Custom::new_allocation(
+                        id, alloc_size, self, kind, machine, fields,
+                    ),
                 ))),
         }
     }
@@ -284,7 +337,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         match method {
             BorrowTrackerMethod::StackedBorrows => this.sb_retag_ptr_value(kind, val),
             BorrowTrackerMethod::TreeBorrows => this.tb_retag_ptr_value(kind, val),
-            BorrowTrackerMethod::JuliusBorrows => this.jb_retag_ptr_value(kind, val),
+            BorrowTrackerMethod::JuliusBorrows(fields) =>
+                this.jb_retag_ptr_value(kind, val, fields),
         }
     }
 
@@ -298,7 +352,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         match method {
             BorrowTrackerMethod::StackedBorrows => this.sb_retag_place_contents(kind, place),
             BorrowTrackerMethod::TreeBorrows => this.tb_retag_place_contents(kind, place),
-            BorrowTrackerMethod::JuliusBorrows => this.jb_retag_place_contents(kind, place),
+            BorrowTrackerMethod::JuliusBorrows(fields) =>
+                this.jb_retag_place_contents(kind, place, fields),
         }
     }
 
@@ -308,7 +363,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         match method {
             BorrowTrackerMethod::StackedBorrows => this.sb_protect_place(place),
             BorrowTrackerMethod::TreeBorrows => this.tb_protect_place(place),
-            BorrowTrackerMethod::JuliusBorrows => this.jb_protect_place(place),
+            BorrowTrackerMethod::JuliusBorrows(fields) => this.jb_protect_place(place, fields),
         }
     }
 
@@ -318,7 +373,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         match method {
             BorrowTrackerMethod::StackedBorrows => this.sb_expose_tag(alloc_id, tag),
             BorrowTrackerMethod::TreeBorrows => this.tb_expose_tag(alloc_id, tag),
-            BorrowTrackerMethod::JuliusBorrows => this.jb_expose_tag(alloc_id, tag),
+            BorrowTrackerMethod::JuliusBorrows(fields) => this.jb_expose_tag(alloc_id, tag, fields),
         }
     }
 
@@ -337,7 +392,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
             BorrowTrackerMethod::TreeBorrows =>
                 this.tb_give_pointer_debug_name(ptr, nth_parent, name),
-            BorrowTrackerMethod::JuliusBorrows =>
+            BorrowTrackerMethod::JuliusBorrows(_) =>
                 this.jb_give_pointer_debug_name(ptr, nth_parent, name),
         }
     }
@@ -352,7 +407,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         match method {
             BorrowTrackerMethod::StackedBorrows => this.print_stacks(alloc_id),
             BorrowTrackerMethod::TreeBorrows => this.print_tree(alloc_id, show_unnamed),
-            BorrowTrackerMethod::JuliusBorrows =>
+            BorrowTrackerMethod::JuliusBorrows(_) =>
                 this.jb_print_borrow_state(alloc_id, show_unnamed),
         }
     }
@@ -434,6 +489,14 @@ impl machine::AllocExtra<'_> {
     pub fn borrow_tracker_jb(&self) -> &RefCell<julius_borrows::Custom> {
         match self.borrow_tracker {
             Some(AllocState::JuliusBorrows(ref jb)) => jb,
+            _ => panic!("expected Julius Borrows borrow tracking, got something else"),
+        }
+    }
+
+    #[track_caller]
+    pub fn borrow_tracker_jb_mut(&mut self) -> &mut RefCell<julius_borrows::Custom> {
+        match self.borrow_tracker {
+            Some(AllocState::JuliusBorrows(ref mut jb)) => jb,
             _ => panic!("expected Julius Borrows borrow tracking, got something else"),
         }
     }

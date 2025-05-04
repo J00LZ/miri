@@ -9,6 +9,7 @@ pub struct BasicStackCheckerBuilder;
 #[derive(Debug, Clone)]
 pub struct BasicStackChecker {
     root: BorTag,
+    
 }
 
 impl CheckerBuilder for BasicStackCheckerBuilder {

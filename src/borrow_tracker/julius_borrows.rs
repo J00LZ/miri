@@ -2,16 +2,17 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use rustc_abi::Size;
-use rustc_const_eval::interpret::{interp_ok, AllocId, AllocKind, AllocRange, InterpResult};
+use rustc_const_eval::interpret::{alloc_range, interp_ok, AllocId, AllocKind, AllocRange, InterpResult};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::mir::RetagKind;
+use rustc_middle::mir::interpret::CheckInAllocMsg;
 use tracing::trace;
-use self::stacked::BasicStackCheckerBuilder;
 
-use super::{BorTag, GlobalState, GlobalStateInner};
+use self::stacked::BasicStackCheckerBuilder;
+use super::{BorTag, GlobalState, GlobalStateInner, JuliusBorrowsFields, ProtectorKind};
+use crate::diagnostics::EvalContextExt as _;
 use crate::{
-    AccessKind, ImmTy, MPlaceTy, MemoryKind, MiriMachine, PlaceTy, Pointer, ProvenanceExtra,
-    VisitProvenance,
+    AccessKind, ImmTy, Item, MPlaceTy, MemoryKind, MiriMachine, NonHaltingDiagnostic, Permission, PlaceTy, Pointer, Provenance, ProvenanceExtra, VisitProvenance
 };
 
 mod stacked;
@@ -138,6 +139,7 @@ pub trait Checker: std::fmt::Debug {
 #[derive(Debug, Clone)]
 pub struct Custom {
     checker: Rc<RefCell<dyn Checker>>,
+    fields: JuliusBorrowsFields,
 }
 
 impl<'tcx> Custom {
@@ -147,12 +149,13 @@ impl<'tcx> Custom {
         state: &mut GlobalStateInner,
         kind: MemoryKind,
         machine: &MiriMachine<'tcx>,
+        fields: JuliusBorrowsFields,
     ) -> Self {
         let root = state.root_ptr_tag(id, machine);
 
         let b = BasicStackCheckerBuilder.build_checker(id, size, kind, root);
         let checker = Rc::new(RefCell::new(b));
-        Self { checker }
+        Self { checker, fields }
     }
 
     pub fn before_memory_access(
@@ -242,12 +245,25 @@ impl VisitProvenance for Custom {
     }
 }
 
+enum NewPermission {
+    Uniform { perm: Permission, access: Option<AccessKind>, protector: Option<ProtectorKind> },
+}
+
+impl NewPermission {
+    fn protector(&self) -> Option<ProtectorKind> {
+        match self {
+            NewPermission::Uniform { protector, .. } => *protector,
+        }
+    }
+}
+
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn jb_retag_ptr_value(
         &mut self,
         kind: RetagKind,
         val: &ImmTy<'tcx>,
+        fields: JuliusBorrowsFields,
     ) -> InterpResult<'tcx, ImmTy<'tcx>> {
         interp_ok(val.clone())
     }
@@ -256,21 +272,33 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         &mut self,
         kind: RetagKind,
         place: &PlaceTy<'tcx>,
+        fields: JuliusBorrowsFields,
     ) -> InterpResult<'tcx> {
         interp_ok(())
     }
 
-    fn jb_protect_place(&mut self, place: &MPlaceTy<'tcx>) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
+    fn jb_protect_place(
+        &mut self,
+        place: &MPlaceTy<'tcx>,
+        fields: JuliusBorrowsFields,
+    ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
         let this = self.eval_context_mut();
-        return interp_ok(place.clone());
-        let (id, s, x) = this.ptr_get_alloc_id(place.ptr(), 0)?;
-        let extra = this.get_alloc_extra(id)?;
-        let cell = extra.borrow_tracker_jb();
-        let mut borrow_tracker = cell.borrow_mut();
-        borrow_tracker.protect_place(place)
+
+        let new_perm = NewPermission::Uniform {
+            perm: Permission::Unique,
+            access: Some(AccessKind::Write),
+            protector: Some(ProtectorKind::StrongProtector),
+        };
+
+        this.jb_retag_place(place, new_perm, (), fields)
     }
 
-    fn jb_expose_tag(&self, alloc_id: AllocId, tag: BorTag) -> InterpResult<'tcx> {
+    fn jb_expose_tag(
+        &self,
+        alloc_id: AllocId,
+        tag: BorTag,
+        fields: JuliusBorrowsFields,
+    ) -> InterpResult<'tcx> {
         let this = self.eval_context_ref();
 
         // Function pointers and dead objects don't have an alloc_extra so we ignore them.
@@ -320,5 +348,125 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let cell = extra.borrow_tracker_jb();
         let borrow_tracker = cell.borrow();
         borrow_tracker.print_borrow_state(alloc_id, show_unnamed)
+    }
+}
+
+impl<'tcx, 'ecx> EvalContextPrivExt<'tcx, 'ecx> for crate::MiriInterpCx<'tcx> {}
+trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
+    fn jb_retag_place(
+        &mut self,
+        place: &MPlaceTy<'tcx>,
+        new_perm: NewPermission,
+        info: (),
+        fields: JuliusBorrowsFields,
+    ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
+        let this = self.eval_context_mut();
+        let size = this.size_and_align_of_mplace(place)?.map(|(size, _)| size);
+
+        let size = match size {
+            Some(size) => size,
+            None => {
+                if !this.machine.sb_extern_type_warned.replace(true) {
+                    this.emit_diagnostic(NonHaltingDiagnostic::ExternTypeReborrow);
+                }
+                return interp_ok(place.clone());
+            }
+        };
+
+        let new_tag = this.machine.borrow_tracker.as_mut().unwrap().get_mut().new_ptr();
+
+        let new_prov = this.jb_reborrow(
+            place, size, new_perm, new_tag,
+            // retag_info, // diagnostics info about this retag
+        )?;
+
+        interp_ok(place.clone().map_provenance(|_| new_prov.unwrap()))
+    }
+
+    fn jb_reborrow(
+        &mut self,
+        place: &MPlaceTy<'tcx>,
+        size: Size,
+        new_perm: NewPermission,
+        new_tag: BorTag,
+        // retag_info: RetagInfo, // diagnostics info about this retag
+    ) -> InterpResult<'tcx, Option<Provenance>> {
+        let this = self.eval_context_mut();
+        // Ensure we bail out if the pointer goes out-of-bounds (see miri#1050).
+        this.check_ptr_access(place.ptr(), size, CheckInAllocMsg::InboundsTest)?;
+        if size == Size::ZERO {
+            trace!(
+                "reborrow of size 0: reference {:?} derived from {:?} (pointee {})",
+                new_tag,
+                place.ptr(),
+                place.layout.ty,
+            );
+            // Don't update any stacks for a zero-sized access; borrow stacks are per-byte and this
+            // touches no bytes so there is no stack to put this tag in.
+            // However, if the pointer for this operation points at a real allocation we still
+            // record where it was created so that we can issue a helpful diagnostic if there is an
+            // attempt to use it for a non-zero-sized access.
+            // Dangling slices are a common case here; it's valid to get their length but with raw
+            // pointer tagging for example all calls to get_unchecked on them are invalid.
+            if let Ok((alloc_id, _, _)) = this.ptr_try_get_alloc_id(place.ptr(), 0) {
+                // log_creation(this, Some((alloc_id, base_offset, orig_tag)))?;
+                // Still give it the new provenance, it got retagged after all.
+                return interp_ok(Some(Provenance::Concrete { alloc_id, tag: new_tag }));
+            } else {
+                // This pointer doesn't come with an AllocId. :shrug:
+                // log_creation(this, None)?;
+                // Provenance unchanged.
+                return interp_ok(place.ptr().provenance);
+            }
+        }
+
+        let (alloc_id, base_offset, orig_tag) = this.ptr_get_alloc_id(place.ptr(), 0)?;
+
+        if let Some(protect) = new_perm.protector() {
+            // See comment in `Stack::item_invalidated` for why we store the tag twice.
+            this.frame_mut()
+                .extra
+                .borrow_tracker
+                .as_mut()
+                .unwrap()
+                .protected_tags
+                .push((alloc_id, new_tag));
+            this.machine
+                .borrow_tracker
+                .as_mut()
+                .unwrap()
+                .get_mut()
+                .protected_tags
+                .insert(new_tag, protect);
+        }
+
+        match new_perm {
+            NewPermission::Uniform { perm, access, protector } => {
+                assert!(perm != Permission::SharedReadOnly);
+                let (alloc_extra, machine) = this.get_alloc_extra_mut(alloc_id)?;
+
+                let jb = alloc_extra.borrow_tracker_jb_mut().get_mut();
+                let item = Item::new(new_tag, perm, protector.is_some());
+                let range = alloc_range(base_offset, size);
+                let global = machine.borrow_tracker.as_ref().unwrap().borrow();
+
+
+                drop(global);
+            }
+        }
+
+        interp_ok(None)
+    }
+
+    fn sb_retag_reference(
+        &mut self,
+        val: &ImmTy<'tcx>,
+        new_perm: NewPermission,
+        fields: JuliusBorrowsFields,
+    ) -> InterpResult<'tcx, ImmTy<'tcx>> {
+        let this = self.eval_context_mut();
+        let place = this.ref_to_mplace(val)?;
+        let new_place = this.jb_retag_place(&place, new_perm, (), fields)?;
+        interp_ok(ImmTy::from_immediate(new_place.to_ref(this), val.layout))
     }
 }
