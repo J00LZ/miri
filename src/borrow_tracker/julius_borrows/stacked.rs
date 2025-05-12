@@ -37,7 +37,7 @@ impl Checker for BasicStackChecker {
         ) -> rustc_const_eval::interpret::InterpResult<'tcx>
         where
             'tcx: 'ecx, {
-        // println!("Checking access: {:?} {:?} {:?}", mode, alloc_id, tag);
+        println!("Checking access: {:?} {:?} {:?}", mode, alloc_id, tag);
 
         interp_ok(())
     }
