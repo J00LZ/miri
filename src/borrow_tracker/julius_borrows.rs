@@ -2,17 +2,26 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use rustc_abi::Size;
-use rustc_const_eval::interpret::{alloc_range, interp_ok, AllocId, AllocKind, AllocRange, InterpResult};
+use rustc_ast::Mutability;
+use rustc_const_eval::interpret::{
+    AllocId, AllocKind, AllocRange, InterpResult, alloc_range, interp_ok,
+};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::mir::RetagKind;
 use rustc_middle::mir::interpret::CheckInAllocMsg;
+use rustc_middle::ty::{self, Ty};
 use tracing::trace;
 
 use self::stacked::BasicStackCheckerBuilder;
+use super::stacked_borrows::diagnostics::RetagCause;
 use super::{BorTag, GlobalState, GlobalStateInner, JuliusBorrowsFields, ProtectorKind};
+use crate::concurrency::data_race::{NaReadType, NaWriteType};
 use crate::diagnostics::EvalContextExt as _;
+use crate::helpers::EvalContextExt as _;
+use crate::rustc_middle::ty::layout::HasTypingEnv;
 use crate::{
-    AccessKind, ImmTy, Item, MPlaceTy, MemoryKind, MiriMachine, NonHaltingDiagnostic, Permission, PlaceTy, Pointer, Provenance, ProvenanceExtra, VisitProvenance
+    AccessKind, ImmTy, Item, MPlaceTy, MemoryKind, MiriMachine, NonHaltingDiagnostic, Permission,
+    PlaceTy, Pointer, Provenance, ProvenanceExtra, VisitProvenance,
 };
 
 mod stacked;
@@ -54,6 +63,7 @@ pub trait Checker: std::fmt::Debug {
     where
         'tcx: 'ecx,
     {
+        // ignore wildcards for now
         interp_ok(())
     }
 
@@ -79,6 +89,7 @@ pub trait Checker: std::fmt::Debug {
     where
         'tcx: 'ecx,
     {
+        // ignore wildcards for now
         interp_ok(())
     }
 
@@ -107,8 +118,8 @@ pub trait Checker: std::fmt::Debug {
         interp_ok(val.clone())
     }
 
-    fn expose_tag<'tcx>(&mut self, tag: BorTag) -> InterpResult<'tcx> {
-        interp_ok(())
+    fn expose_tag<'tcx>(&mut self, tag: BorTag) {
+        // implemented by stacked borrows, not by tree borrows
     }
 
     fn protect_place<'tcx>(
@@ -213,7 +224,7 @@ impl<'tcx> Custom {
         checker.release_protector(machine, global, tag, alloc_id)
     }
 
-    fn expose_tag(&mut self, tag: BorTag) -> InterpResult<'tcx> {
+    fn expose_tag(&mut self, tag: BorTag) {
         let mut checker = self.checker.borrow_mut();
         checker.expose_tag(tag)
     }
@@ -237,6 +248,10 @@ impl<'tcx> Custom {
         let mut checker = self.checker.borrow_mut();
         checker.print_borrow_state(alloc_id, show_unnamed)
     }
+
+    fn for_each(&self, range: AllocRange, f: impl Fn()) {
+        todo!()
+    }
 }
 
 impl VisitProvenance for Custom {
@@ -246,13 +261,94 @@ impl VisitProvenance for Custom {
 }
 
 enum NewPermission {
-    Uniform { perm: Permission, access: Option<AccessKind>, protector: Option<ProtectorKind> },
+    Uniform {
+        perm: Permission,
+        access: Option<AccessKind>,
+        protector: Option<ProtectorKind>,
+    },
+    FreezeSensitive {
+        freeze_perm: Permission,
+        freeze_access: Option<AccessKind>,
+        freeze_protector: Option<ProtectorKind>,
+        nonfreeze_perm: Permission,
+        nonfreeze_access: Option<AccessKind>,
+    },
 }
 
 impl NewPermission {
     fn protector(&self) -> Option<ProtectorKind> {
         match self {
             NewPermission::Uniform { protector, .. } => *protector,
+            NewPermission::FreezeSensitive { freeze_protector, .. } => *freeze_protector,
+        }
+    }
+
+    /// A key function: determine the permissions to grant at a retag for the given kind of
+    /// reference/pointer.
+    fn from_ref_ty<'tcx>(ty: Ty<'tcx>, kind: RetagKind, cx: &crate::MiriInterpCx<'tcx>) -> Self {
+        let protector = (kind == RetagKind::FnEntry).then_some(ProtectorKind::StrongProtector);
+        match ty.kind() {
+            ty::Ref(_, pointee, Mutability::Mut) => {
+                if kind == RetagKind::TwoPhase {
+                    // We mostly just give up on 2phase-borrows, and treat these exactly like raw pointers.
+                    assert!(protector.is_none()); // RetagKind can't be both FnEntry and TwoPhase.
+                    NewPermission::Uniform {
+                        perm: Permission::SharedReadWrite,
+                        access: None,
+                        protector: None,
+                    }
+                } else if pointee.is_unpin(*cx.tcx, cx.typing_env()) {
+                    // A regular full mutable reference. On `FnEntry` this is `noalias` and `dereferenceable`.
+                    NewPermission::Uniform {
+                        perm: Permission::Unique,
+                        access: Some(AccessKind::Write),
+                        protector,
+                    }
+                } else {
+                    // `!Unpin` dereferences do not get `noalias` nor `dereferenceable`.
+                    NewPermission::Uniform {
+                        perm: Permission::SharedReadWrite,
+                        access: None,
+                        protector: None,
+                    }
+                }
+            }
+            ty::RawPtr(_, Mutability::Mut) => {
+                assert!(protector.is_none()); // RetagKind can't be both FnEntry and Raw.
+                // Mutable raw pointer. No access, not protected.
+                NewPermission::Uniform {
+                    perm: Permission::SharedReadWrite,
+                    access: None,
+                    protector: None,
+                }
+            }
+            ty::Ref(_, _pointee, Mutability::Not) => {
+                // Shared references. If frozen, these get `noalias` and `dereferenceable`; otherwise neither.
+                NewPermission::FreezeSensitive {
+                    freeze_perm: Permission::SharedReadOnly,
+                    freeze_access: Some(AccessKind::Read),
+                    freeze_protector: protector,
+                    nonfreeze_perm: Permission::SharedReadWrite,
+                    // Inside UnsafeCell, this does *not* count as an access, as there
+                    // might actually be mutable references further up the stack that
+                    // we have to keep alive.
+                    nonfreeze_access: None,
+                    // We do not protect inside UnsafeCell.
+                    // This fixes https://github.com/rust-lang/rust/issues/55005.
+                }
+            }
+            ty::RawPtr(_, Mutability::Not) => {
+                assert!(protector.is_none()); // RetagKind can't be both FnEntry and Raw.
+                // `*const T`, when freshly created, are read-only in the frozen part.
+                NewPermission::FreezeSensitive {
+                    freeze_perm: Permission::SharedReadOnly,
+                    freeze_access: Some(AccessKind::Read),
+                    freeze_protector: None,
+                    nonfreeze_perm: Permission::SharedReadWrite,
+                    nonfreeze_access: None,
+                }
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -265,7 +361,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         val: &ImmTy<'tcx>,
         fields: JuliusBorrowsFields,
     ) -> InterpResult<'tcx, ImmTy<'tcx>> {
-        interp_ok(val.clone())
+        let this = self.eval_context_mut();
+        let new_perm = NewPermission::from_ref_ty(val.layout.ty, kind, this);
+        this.sb_retag_reference(val, new_perm, fields)
     }
 
     fn jb_retag_place_contents(
@@ -312,7 +410,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // uncovers a non-supported `extern static`.
                 let alloc_extra = this.get_alloc_extra(alloc_id)?;
                 trace!("Custom Borrows tag {tag:?} exposed in {alloc_id:?}");
-                alloc_extra.borrow_tracker_tb().borrow_mut().expose_tag(tag);
+                alloc_extra.borrow_tracker_jb().borrow_mut().expose_tag(tag);
             }
             AllocKind::Function | AllocKind::VTable | AllocKind::Dead => {
                 // No need to do anything, we don't track these.
@@ -450,8 +548,62 @@ trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
                 let range = alloc_range(base_offset, size);
                 let global = machine.borrow_tracker.as_ref().unwrap().borrow();
 
-
+                jb.for_each(range, || {});
                 drop(global);
+
+                if let Some(access) = access {
+                    assert_eq!(access, AccessKind::Write);
+                    // Make sure the data race model also knows about this.
+                    if let Some(data_race) = alloc_extra.data_race.as_mut() {
+                        data_race.write(
+                            alloc_id,
+                            range,
+                            NaWriteType::Retag,
+                            Some(place.layout.ty),
+                            machine,
+                        )?;
+                    }
+                }
+            }
+            NewPermission::FreezeSensitive {
+                freeze_perm,
+                freeze_access,
+                freeze_protector,
+                nonfreeze_perm,
+                nonfreeze_access,
+            } => {
+                let alloc_extra = this.get_alloc_extra(alloc_id)?;
+                let mut borrows = alloc_extra.borrow_tracker_jb().borrow_mut();
+                this.visit_freeze_sensitive(place, size, |mut range, frozen| {
+                    range.start += base_offset;
+
+                    let (perm, access, protector) = if frozen {
+                        (freeze_perm, freeze_access, freeze_protector)
+                    } else {
+                        (nonfreeze_perm, nonfreeze_access, None)
+                    };
+
+                    let item = Item::new(new_tag, perm, protector.is_some());
+                    let global = this.machine.borrow_tracker.as_ref().unwrap().borrow();
+
+                    borrows.for_each(range, || {});
+                    drop(global);
+                    if let Some(access) = access {
+                        assert_eq!(access, AccessKind::Read);
+                        // Make sure the data race model also knows about this.
+                        if let Some(data_race) = alloc_extra.data_race.as_ref() {
+                            data_race.read(
+                                alloc_id,
+                                range,
+                                NaReadType::Retag,
+                                Some(place.layout.ty),
+                                &this.machine,
+                            )?;
+                        }
+                    }
+
+                    interp_ok(())
+                })?;
             }
         }
 
