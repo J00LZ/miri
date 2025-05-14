@@ -7,13 +7,13 @@ use rand::Rng;
 use rustc_abi::Size;
 use rustc_apfloat::{Float, Round};
 use rustc_middle::mir;
-use rustc_middle::ty::{self, FloatTy, ScalarInt};
+use rustc_middle::ty::{self, FloatTy};
 use rustc_span::{Symbol, sym};
 
 use self::atomic::EvalContextExt as _;
 use self::helpers::{ToHost, ToSoft, check_intrinsic_arg_count};
 use self::simd::EvalContextExt as _;
-use crate::math::apply_random_float_error_ulp;
+use crate::math::apply_random_float_error_to_imm;
 use crate::*;
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
@@ -27,6 +27,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<ty::Instance<'tcx>>> {
         let this = self.eval_context_mut();
+
+        // Force use of fallback body, if available.
+        if this.machine.force_intrinsic_fallback
+            && !this.tcx.intrinsic(instance.def_id()).unwrap().must_be_overridden
+        {
+            return interp_ok(Some(ty::Instance {
+                def: ty::InstanceKind::Item(instance.def_id()),
+                args: instance.args,
+            }));
+        }
 
         // See if the core engine can handle this intrinsic.
         if this.eval_intrinsic(instance, args, dest, ret)? {
@@ -392,32 +402,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
 
             #[rustfmt::skip]
-            | "fadd_algebraic"
-            | "fsub_algebraic"
-            | "fmul_algebraic"
-            | "fdiv_algebraic"
-            | "frem_algebraic"
-            => {
-                let [a, b] = check_intrinsic_arg_count(args)?;
-                let a = this.read_immediate(a)?;
-                let b = this.read_immediate(b)?;
-                let op = match intrinsic_name {
-                    "fadd_algebraic" => mir::BinOp::Add,
-                    "fsub_algebraic" => mir::BinOp::Sub,
-                    "fmul_algebraic" => mir::BinOp::Mul,
-                    "fdiv_algebraic" => mir::BinOp::Div,
-                    "frem_algebraic" => mir::BinOp::Rem,
-                    _ => bug!(),
-                };
-                let res = this.binary_op(op, &a, &b)?;
-                // `binary_op` already called `generate_nan` if needed.
-                // Apply a relative error of 16ULP to simulate non-deterministic precision loss
-                // due to optimizations.
-                let res = apply_random_float_error_to_imm(this, res, 4 /* log2(16) */)?;
-                this.write_immediate(*res, dest)?;
-            }
-
-            #[rustfmt::skip]
             | "fadd_fast"
             | "fsub_fast"
             | "fmul_fast"
@@ -464,9 +448,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 if !float_finite(&res)? {
                     throw_ub_format!("`{intrinsic_name}` intrinsic produced non-finite value as result");
                 }
-                // Apply a relative error of 16ULP to simulate non-deterministic precision loss
+                // Apply a relative error of 4ULP to simulate non-deterministic precision loss
                 // due to optimizations.
-                let res = apply_random_float_error_to_imm(this, res, 4 /* log2(16) */)?;
+                let res = apply_random_float_error_to_imm(this, res, 2 /* log2(4) */)?;
                 this.write_immediate(*res, dest)?;
             }
 
@@ -498,27 +482,4 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         interp_ok(EmulateItemResult::NeedsReturn)
     }
-}
-
-/// Applies a random 16ULP floating point error to `val` and returns the new value.
-/// Will fail if `val` is not a floating point number.
-fn apply_random_float_error_to_imm<'tcx>(
-    ecx: &mut MiriInterpCx<'tcx>,
-    val: ImmTy<'tcx>,
-    ulp_exponent: u32,
-) -> InterpResult<'tcx, ImmTy<'tcx>> {
-    let scalar = val.to_scalar_int()?;
-    let res: ScalarInt = match val.layout.ty.kind() {
-        ty::Float(FloatTy::F16) =>
-            apply_random_float_error_ulp(ecx, scalar.to_f16(), ulp_exponent).into(),
-        ty::Float(FloatTy::F32) =>
-            apply_random_float_error_ulp(ecx, scalar.to_f32(), ulp_exponent).into(),
-        ty::Float(FloatTy::F64) =>
-            apply_random_float_error_ulp(ecx, scalar.to_f64(), ulp_exponent).into(),
-        ty::Float(FloatTy::F128) =>
-            apply_random_float_error_ulp(ecx, scalar.to_f128(), ulp_exponent).into(),
-        _ => bug!("intrinsic called with non-float input type"),
-    };
-
-    interp_ok(ImmTy::from_scalar_int(res, val.layout))
 }

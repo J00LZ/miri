@@ -1,6 +1,5 @@
 #![feature(rustc_private)]
 #![feature(cfg_match)]
-#![feature(cell_update)]
 #![feature(float_gamma)]
 #![feature(float_erf)]
 #![feature(map_try_insert)]
@@ -10,7 +9,6 @@
 #![feature(variant_count)]
 #![feature(yeet_expr)]
 #![feature(nonzero_ops)]
-#![feature(let_chains)]
 #![feature(strict_overflow_ops)]
 #![feature(pointer_is_aligned_to)]
 #![feature(unqualified_local_imports)]
@@ -135,6 +133,7 @@ pub use crate::concurrency::thread::{
     BlockReason, DynUnblockCallback, EvalContextExt as _, StackEmptyCallback, ThreadId,
     ThreadManager, TimeoutAnchor, TimeoutClock, UnblockKind,
 };
+pub use crate::concurrency::{GenmcConfig, GenmcCtx};
 pub use crate::diagnostics::{
     EvalContextExt as _, NonHaltingDiagnostic, TerminationInfo, report_error,
 };
@@ -170,7 +169,7 @@ pub const MIRI_DEFAULT_ARGS: &[&str] = &[
     "-Zalways-encode-mir",
     "-Zextra-const-ub-checks",
     "-Zmir-emit-retag",
-    "-Zmir-keep-place-mention",
+    "-Zmir-preserve-ub",
     "-Zmir-opt-level=0",
     "-Zmir-enable-passes=-CheckAlignment,-CheckNull",
     // Deduplicating diagnostics means we miss events when tracking what happens during an
