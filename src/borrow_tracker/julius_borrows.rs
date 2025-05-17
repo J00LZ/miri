@@ -1,10 +1,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rustc_abi::Size;
+use rustc_abi::{BackendRepr, Size};
 use rustc_ast::Mutability;
 use rustc_const_eval::interpret::{
-    AllocId, AllocKind, AllocRange, InterpResult, alloc_range, interp_ok,
+    AllocId, AllocKind, AllocRange, InterpResult, PointerArithmetic, alloc_range, interp_ok,
 };
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::mir::RetagKind;
@@ -15,15 +15,16 @@ use tracing::trace;
 use self::stacked::BasicStackCheckerBuilder;
 use super::stacked_borrows::diagnostics::RetagCause;
 use super::{BorTag, GlobalState, GlobalStateInner, JuliusBorrowsFields, ProtectorKind};
+use crate::borrow_tracker::stacked_borrows::diagnostics::RetagInfo;
 use crate::concurrency::data_race::{NaReadType, NaWriteType};
 use crate::diagnostics::EvalContextExt as _;
 use crate::helpers::EvalContextExt as _;
 use crate::rustc_middle::ty::layout::HasTypingEnv;
 use crate::{
-    AccessKind, ImmTy, Item, MPlaceTy, MemoryKind, MiriMachine, NonHaltingDiagnostic, Permission,
-    PlaceTy, Pointer, Provenance, ProvenanceExtra, VisitProvenance,
+    AccessKind, ImmTy, Item, MPlaceTy, MemoryKind, MiriInterpCx, MiriMachine, NonHaltingDiagnostic,
+    Permission, PlaceTy, Pointer, Provenance, ProvenanceExtra, RetagFields, ValueVisitor,
+    VisitProvenance,
 };
-
 mod stacked;
 
 pub trait CheckerBuilder {
@@ -110,23 +111,8 @@ pub trait Checker: std::fmt::Debug {
         interp_ok(())
     }
 
-    fn retag_pointer_value<'tcx>(
-        &mut self,
-        kind: RetagKind,
-        val: &ImmTy<'tcx>,
-    ) -> InterpResult<'tcx, ImmTy<'tcx>> {
-        interp_ok(val.clone())
-    }
-
     fn expose_tag<'tcx>(&mut self, tag: BorTag) {
         // implemented by stacked borrows, not by tree borrows
-    }
-
-    fn protect_place<'tcx>(
-        &mut self,
-        place: &MPlaceTy<'tcx>,
-    ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
-        interp_ok(place.clone())
     }
 
     fn give_pointer_debug_name<'tcx>(
@@ -229,11 +215,6 @@ impl<'tcx> Custom {
         checker.expose_tag(tag)
     }
 
-    fn protect_place(&mut self, place: &MPlaceTy<'tcx>) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
-        let mut checker = self.checker.borrow_mut();
-        checker.protect_place(place)
-    }
-
     fn give_pointer_debug_name(
         &mut self,
         ptr: Pointer,
@@ -249,7 +230,11 @@ impl<'tcx> Custom {
         checker.print_borrow_state(alloc_id, show_unnamed)
     }
 
-    fn for_each(&mut self, range: AllocRange, f: impl Fn()-> InterpResult<'tcx>) -> InterpResult<'tcx> {
+    fn for_each(
+        &mut self,
+        range: AllocRange,
+        f: impl Fn() -> InterpResult<'tcx>,
+    ) -> InterpResult<'tcx> {
         f()
     }
 }
@@ -351,6 +336,27 @@ impl NewPermission {
             _ => unreachable!(),
         }
     }
+
+    fn from_box_ty<'tcx>(ty: Ty<'tcx>, kind: RetagKind, cx: &crate::MiriInterpCx<'tcx>) -> Self {
+        // `ty` is not the `Box` but the field of the Box with this pointer (due to allocator handling).
+        let pointee = ty.builtin_deref(true).unwrap();
+        if pointee.is_unpin(*cx.tcx, cx.typing_env()) {
+            // A regular box. On `FnEntry` this is `noalias`, but not `dereferenceable` (hence only
+            // a weak protector).
+            NewPermission::Uniform {
+                perm: Permission::Unique,
+                access: Some(AccessKind::Write),
+                protector: (kind == RetagKind::FnEntry).then_some(ProtectorKind::WeakProtector),
+            }
+        } else {
+            // `!Unpin` boxes do not get `noalias` nor `dereferenceable`.
+            NewPermission::Uniform {
+                perm: Permission::SharedReadWrite,
+                access: None,
+                protector: None,
+            }
+        }
+    }
 }
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
@@ -363,7 +369,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, ImmTy<'tcx>> {
         let this = self.eval_context_mut();
         let new_perm = NewPermission::from_ref_ty(val.layout.ty, kind, this);
-        this.sb_retag_reference(val, new_perm, fields)
+        this.jb_retag_reference(val, new_perm, fields)
     }
 
     fn jb_retag_place_contents(
@@ -372,7 +378,102 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         place: &PlaceTy<'tcx>,
         fields: JuliusBorrowsFields,
     ) -> InterpResult<'tcx> {
-        interp_ok(())
+        let this = self.eval_context_mut();
+        let retag_fields = this.machine.borrow_tracker.as_mut().unwrap().get_mut().retag_fields;
+        let mut visitor =
+            RetagVisitor { ecx: this, kind, retag_fields, in_field: false, fields };
+        return visitor.visit_value(place);
+
+        // The actual visitor.
+        struct RetagVisitor<'ecx, 'tcx> {
+            ecx: &'ecx mut MiriInterpCx<'tcx>,
+            kind: RetagKind,
+            retag_fields: RetagFields,
+            in_field: bool,
+            fields: JuliusBorrowsFields,
+        }
+        impl<'ecx, 'tcx> RetagVisitor<'ecx, 'tcx> {
+            #[inline(always)] // yes this helps in our benchmarks
+            fn retag_ptr_inplace(
+                &mut self,
+                place: &PlaceTy<'tcx>,
+                new_perm: NewPermission,
+            ) -> InterpResult<'tcx> {
+                let val = self.ecx.read_immediate(&self.ecx.place_to_op(place)?)?;
+                let val = self.ecx.jb_retag_reference(&val, new_perm, self.fields)?;
+                self.ecx.write_immediate(*val, place)?;
+                interp_ok(())
+            }
+        }
+        impl<'ecx, 'tcx> ValueVisitor<'tcx, MiriMachine<'tcx>> for RetagVisitor<'ecx, 'tcx> {
+            type V = PlaceTy<'tcx>;
+
+            #[inline(always)]
+            fn ecx(&self) -> &MiriInterpCx<'tcx> {
+                self.ecx
+            }
+
+            fn visit_box(&mut self, box_ty: Ty<'tcx>, place: &PlaceTy<'tcx>) -> InterpResult<'tcx> {
+                // Only boxes for the global allocator get any special treatment.
+                if box_ty.is_box_global(*self.ecx.tcx) {
+                    // Boxes get a weak protectors, since they may be deallocated.
+                    let new_perm = NewPermission::from_box_ty(place.layout.ty, self.kind, self.ecx);
+                    self.retag_ptr_inplace(place, new_perm)?;
+                }
+                interp_ok(())
+            }
+
+            fn visit_value(&mut self, place: &PlaceTy<'tcx>) -> InterpResult<'tcx> {
+                // If this place is smaller than a pointer, we know that it can't contain any
+                // pointers we need to retag, so we can stop recursion early.
+                // This optimization is crucial for ZSTs, because they can contain way more fields
+                // than we can ever visit.
+                if place.layout.is_sized() && place.layout.size < self.ecx.pointer_size() {
+                    return interp_ok(());
+                }
+
+                // Check the type of this value to see what to do with it (retag, or recurse).
+                match place.layout.ty.kind() {
+                    ty::Ref(..) | ty::RawPtr(..) => {
+                        if matches!(place.layout.ty.kind(), ty::Ref(..))
+                            || self.kind == RetagKind::Raw
+                        {
+                            let new_perm =
+                                NewPermission::from_ref_ty(place.layout.ty, self.kind, self.ecx);
+                            self.retag_ptr_inplace(place, new_perm)?;
+                        }
+                    }
+                    ty::Adt(adt, _) if adt.is_box() => {
+                        // Recurse for boxes, they require some tricky handling and will end up in `visit_box` above.
+                        // (Yes this means we technically also recursively retag the allocator itself
+                        // even if field retagging is not enabled. *shrug*)
+                        self.walk_value(place)?;
+                    }
+                    _ => {
+                        // Not a reference/pointer/box. Only recurse if configured appropriately.
+                        let recurse = match self.retag_fields {
+                            RetagFields::No => false,
+                            RetagFields::Yes => true,
+                            RetagFields::OnlyScalar => {
+                                // Matching `ArgAbi::new` at the time of writing, only fields of
+                                // `Scalar` and `ScalarPair` ABI are considered.
+                                matches!(
+                                    place.layout.backend_repr,
+                                    BackendRepr::Scalar(..) | BackendRepr::ScalarPair(..)
+                                )
+                            }
+                        };
+                        if recurse {
+                            let in_field = std::mem::replace(&mut self.in_field, true); // remember and restore old value
+                            self.walk_value(place)?;
+                            self.in_field = in_field;
+                        }
+                    }
+                }
+
+                interp_ok(())
+            }
+        }
     }
 
     fn jb_protect_place(
@@ -551,6 +652,7 @@ trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
                 jb.for_each(range, || interp_ok(()))?;
                 drop(global);
 
+
                 if let Some(access) = access {
                     assert_eq!(access, AccessKind::Write);
                     // Make sure the data race model also knows about this.
@@ -610,7 +712,7 @@ trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(Some(Provenance::Concrete { alloc_id, tag: new_tag }))
     }
 
-    fn sb_retag_reference(
+    fn jb_retag_reference(
         &mut self,
         val: &ImmTy<'tcx>,
         new_perm: NewPermission,
