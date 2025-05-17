@@ -258,7 +258,7 @@ impl JuliusBorrowsFields {
                         fields.track_mutability = value.trim() == "true";
                     }
                     _ => {
-                        panic!("Unknown argument for Julius Borrows: {}", key);
+                        panic!("Unknown argument for Julius Borrows: {key}");
                     }
                 }
             } else {
@@ -273,7 +273,7 @@ impl JuliusBorrowsFields {
                         fields.track_mutability = true;
                     }
                     _ => {
-                        panic!("Unknown argument for Julius Borrows: {}", arg);
+                        panic!("Unknown argument for Julius Borrows: {arg}");
                     }
                 }
             }

@@ -249,8 +249,8 @@ impl<'tcx> Custom {
         checker.print_borrow_state(alloc_id, show_unnamed)
     }
 
-    fn for_each(&self, range: AllocRange, f: impl Fn()) {
-        todo!()
+    fn for_each(&mut self, range: AllocRange, f: impl Fn()-> InterpResult<'tcx>) -> InterpResult<'tcx> {
+        f()
     }
 }
 
@@ -491,7 +491,7 @@ trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, Option<Provenance>> {
         let this = self.eval_context_mut();
         // Ensure we bail out if the pointer goes out-of-bounds (see miri#1050).
-        this.check_ptr_access(place.ptr(), size, CheckInAllocMsg::InboundsTest)?;
+        this.check_ptr_access(place.ptr(), size, CheckInAllocMsg::Dereferenceable)?;
         if size == Size::ZERO {
             trace!(
                 "reborrow of size 0: reference {:?} derived from {:?} (pointee {})",
@@ -548,13 +548,13 @@ trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
                 let range = alloc_range(base_offset, size);
                 let global = machine.borrow_tracker.as_ref().unwrap().borrow();
 
-                jb.for_each(range, || {});
+                jb.for_each(range, || interp_ok(()))?;
                 drop(global);
 
                 if let Some(access) = access {
                     assert_eq!(access, AccessKind::Write);
                     // Make sure the data race model also knows about this.
-                    if let Some(data_race) = alloc_extra.data_race.as_mut() {
+                    if let Some(data_race) = alloc_extra.data_race.as_vclocks_mut() {
                         data_race.write(
                             alloc_id,
                             range,
@@ -586,12 +586,12 @@ trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
                     let item = Item::new(new_tag, perm, protector.is_some());
                     let global = this.machine.borrow_tracker.as_ref().unwrap().borrow();
 
-                    borrows.for_each(range, || {});
+                    borrows.for_each(range, || interp_ok(()))?;
                     drop(global);
                     if let Some(access) = access {
                         assert_eq!(access, AccessKind::Read);
                         // Make sure the data race model also knows about this.
-                        if let Some(data_race) = alloc_extra.data_race.as_ref() {
+                        if let Some(data_race) = alloc_extra.data_race.as_vclocks_ref() {
                             data_race.read(
                                 alloc_id,
                                 range,
