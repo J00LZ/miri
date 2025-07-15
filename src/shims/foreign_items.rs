@@ -905,6 +905,13 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 }
             }
 
+            x if x.starts_with("miripbt_") => {
+                this.check_abi_and_shim_symbol_clash(abi, Abi::Rust, link_name)?;
+                if let Some(actual_name) = x.strip_prefix("miripbt_") {
+                    shims::pbt::PbtEvalCtx::run_pbt(this, actual_name, args)?;
+                }
+            }
+
             // Target-specific shims
             name if name.starts_with("llvm.x86.")
                 && (this.tcx.sess.target.arch == "x86"

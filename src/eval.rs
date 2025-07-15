@@ -86,6 +86,8 @@ pub struct MiriConfig {
     pub env: Vec<(OsString, OsString)>,
     /// Determine if validity checking is enabled.
     pub validate: bool,
+    /// File that contains the structures of all pbt annotated functions for miripbt.
+    pub pbt_info_file: Option<miripbt_format::MiriPBTFormat>,
     /// Determines if Stacked Borrows or Tree Borrows is enabled.
     pub borrow_tracker: Option<BorrowTrackerMethod>,
     /// Whether `core::ptr::Unique` receives special treatment.
@@ -163,6 +165,7 @@ impl Default for MiriConfig {
         MiriConfig {
             env: vec![],
             validate: true,
+            pbt_info_file: None,
             borrow_tracker: Some(BorrowTrackerMethod::StackedBorrows),
             unique_is_unique: false,
             check_alignment: AlignmentCheck::Int,

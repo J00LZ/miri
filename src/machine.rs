@@ -428,6 +428,8 @@ pub struct MiriMachine<'tcx> {
     // We carry a copy of the global `TyCtxt` for convenience, so methods taking just `&Evaluator` have `tcx` access.
     pub tcx: TyCtxt<'tcx>,
 
+    pub pbt: Option<pbt::Pbt>,
+
     /// Global data for borrow tracking.
     pub borrow_tracker: Option<borrow_tracker::GlobalState>,
 
@@ -629,6 +631,7 @@ impl<'tcx> MiriMachine<'tcx> {
             if tcx.pointer_size().bits() < 32 { page_size * 4 } else { page_size * 16 };
         MiriMachine {
             tcx,
+            pbt: config.pbt_info_file.as_ref().map(pbt::Pbt::new),
             borrow_tracker,
             data_race,
             alloc_addresses: RefCell::new(alloc_addresses::GlobalStateInner::new(config, stack_addr)),
@@ -779,6 +782,7 @@ impl VisitProvenance for MiriMachine<'_> {
             alloc_addresses,
             fds,
             tcx: _,
+            pbt: _,
             isolated_op: _,
             validate: _,
             clock: _,

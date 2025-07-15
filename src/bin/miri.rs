@@ -423,6 +423,15 @@ fn main() {
             after_dashdash = true;
         } else if arg == "-Zmiri-disable-validation" {
             miri_config.validate = false;
+        } else if let Some(param) = arg.strip_prefix("-Zmiri-pbt-file=") {
+            match std::fs::File::open(param) {
+                Ok(f) => {
+                    miri_config.pbt_info_file = serde_json::from_reader(f).ok();
+                },
+                Err(err) => {
+                    eprintln!("Error opening PBT info file `{param}`: {err}");
+                },
+            }
         } else if arg == "-Zmiri-disable-stacked-borrows" {
             miri_config.borrow_tracker = None;
         } else if arg == "-Zmiri-tree-borrows" {

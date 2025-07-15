@@ -8,6 +8,7 @@ mod unix;
 mod wasi;
 mod windows;
 mod x86;
+mod pbt;
 
 pub mod env;
 pub mod extern_static;
