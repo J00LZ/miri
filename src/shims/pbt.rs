@@ -2,14 +2,13 @@ use std::collections::HashMap;
 
 use miripbt_format::{
     communication::{ResponseBody, Value},
-    TypeRef, TypeRefType,
+    TypeRef,
 };
 use nix::{
     sys::wait::{waitpid, WaitStatus},
     unistd::ForkResult,
 };
-use rustc_const_eval::interpret::{MPlaceTy, Provenance};
-use rustc_middle::ty::{layout::LayoutOf, Ty};
+use rustc_const_eval::interpret::{MPlaceTy, Projectable};
 
 use crate::{
     helpers::EvalContextExt, pbt::Pbt, InterpCx, InterpResult, MiriInterpCxExt, MiriMachine, OpTy,
@@ -34,21 +33,22 @@ pub trait PbtEvalCtx<'tcx>: MiriInterpCxExt<'tcx> {
                     }
                 }
 
-                let mut res = HashMap::<i32,i32>::new();
+                let mut res = HashMap::<i32, i32>::new();
                 let mut is_main = true;
                 for _ in 0..10 {
+                    let ResponseBody::Data(body) =
+                        pbt.write(miripbt_format::communication::RequestBody::Request(
+                            f.name.clone(),
+                            miripbt_format::communication::PBTType::Values,
+                        ))
+                    else {
+                        return Ok(());
+                    };
                     for (arg_name, (idx, arg)) in &elements {
-                        println!("running for arg {arg_name}");
+                        #[allow(clippy::cast_possible_truncation)]
                         let actual_arg = &args[*idx as usize];
-                        let ResponseBody::Data(body) =
-                            pbt.write(miripbt_format::communication::RequestBody::Request(
-                                arg.type_ref.clone(),
-                            ))
-                        else {
-                            continue;
-                        };
+                        let body = body.get(arg_name).cloned().unwrap_or(Value::Unit);
                         let mut target = this.deref_pointer(actual_arg)?;
-                        println!("deref 1");
                         match arg.kind {
                             miripbt_format::TypeRefKind::Value
                             | miripbt_format::TypeRefKind::Other => {}
@@ -59,18 +59,18 @@ pub trait PbtEvalCtx<'tcx>: MiriInterpCxExt<'tcx> {
                                 target = this.deref_pointer(&target)?;
                             }
                         }
-                        println!("deref 1");
 
                         update_single_value(this, target, arg, body, &mut pbt)?;
                     }
                     match unsafe { nix::unistd::fork() } {
                         Ok(ForkResult::Parent { child }) => {
-                            let WaitStatus::Exited(pid, code) = waitpid(child, None).unwrap()
+                            let WaitStatus::Exited(_pid, code) = waitpid(child, None).unwrap()
                             else {
                                 panic!("Wait failed!!!")
                             };
                             println!("Recieved code {code}!");
-                            *res.entry(code).or_default() += 1;
+                            let e = res.entry(code).or_default();
+                            *e = e.saturating_add(1);
                         }
                         Ok(ForkResult::Child) => {
                             is_main = false;
@@ -79,7 +79,7 @@ pub trait PbtEvalCtx<'tcx>: MiriInterpCxExt<'tcx> {
                         Err(_) => panic!("Fork failed!!"),
                     }
                 }
-                if is_main { 
+                if is_main {
                     println!("Final result:");
                     for (code, count) in res {
                         println!("Code {code} was returned {count} times");
@@ -96,6 +96,7 @@ pub trait PbtEvalCtx<'tcx>: MiriInterpCxExt<'tcx> {
 
 impl<'tcx> PbtEvalCtx<'tcx> for crate::MiriInterpCx<'tcx> {}
 
+#[allow(clippy::cast_possible_truncation)]
 fn update_single_value<'tcx>(
     this: &mut InterpCx<'tcx, MiriMachine<'tcx>>,
     target: MPlaceTy<'tcx, crate::machine::Provenance>,
@@ -103,62 +104,61 @@ fn update_single_value<'tcx>(
     body: Value,
     pbt: &mut Pbt,
 ) -> InterpResult<'tcx> {
-    println!("{arg:?}");
     match &arg.type_ref {
         miripbt_format::TypeRefType::Primitive(primitive_type) =>
             match (primitive_type, body) {
                 (miripbt_format::PrimitiveType::Bool, Value::Bool(b)) => {
                     modify_value(this, target, |this, target| {
-                        this.write_scalar(Scalar::Int(b.into()), &target)
+                        this.write_scalar(Scalar::from_bool(b), &target)
                     })?;
                 }
                 (miripbt_format::PrimitiveType::Isize, Value::INum(i)) =>
                     modify_value(this, target, |this, target| {
-                        this.write_scalar(Scalar::Int((i as i64 as u64).into()), &target)
+                        this.write_scalar(Scalar::from_target_isize(i as i64, this), &target)
                     })?,
                 (miripbt_format::PrimitiveType::I8, Value::INum(i)) =>
                     modify_value(this, target, |this, target| {
-                        this.write_scalar(Scalar::Int((i as i8 as u8).into()), &target)
+                        this.write_scalar(Scalar::from_i8(i as i8), &target)
                     })?,
                 (miripbt_format::PrimitiveType::I16, Value::INum(i)) =>
                     modify_value(this, target, |this, target| {
-                        this.write_scalar(Scalar::Int((i as i16 as u16).into()), &target)
+                        this.write_scalar(Scalar::from_i16(i as i16), &target)
                     })?,
                 (miripbt_format::PrimitiveType::I32, Value::INum(i)) =>
                     modify_value(this, target, |this, target| {
-                        this.write_scalar(Scalar::Int((i as i32 as u32).into()), &target)
+                        this.write_scalar(Scalar::from_i32(i as i32), &target)
                     })?,
                 (miripbt_format::PrimitiveType::I64, Value::INum(i)) =>
                     modify_value(this, target, |this, target| {
-                        this.write_scalar(Scalar::Int((i as i64 as u64).into()), &target)
+                        this.write_scalar(Scalar::from_i64(i as i64), &target)
                     })?,
                 (miripbt_format::PrimitiveType::I128, Value::INum(i)) =>
                     modify_value(this, target, |this, target| {
-                        this.write_scalar(Scalar::Int((i as i128 as u128).into()), &target)
+                        this.write_scalar(Scalar::from_i128(i), &target)
                     })?,
                 (miripbt_format::PrimitiveType::Usize, Value::UNum(u)) =>
                     modify_value(this, target, |this, target| {
-                        this.write_scalar(Scalar::Int((u as usize as u64).into()), &target)
+                        this.write_scalar(Scalar::from_target_usize(u as u64, this), &target)
                     })?,
                 (miripbt_format::PrimitiveType::U8, Value::UNum(u)) =>
                     modify_value(this, target, |this, target| {
-                        this.write_scalar(Scalar::Int((u as u8).into()), &target)
+                        this.write_scalar(Scalar::from_u8(u as u8), &target)
                     })?,
                 (miripbt_format::PrimitiveType::U16, Value::UNum(u)) =>
                     modify_value(this, target, |this, target| {
-                        this.write_scalar(Scalar::Int((u as u16).into()), &target)
+                        this.write_scalar(Scalar::from_u16(u as u16), &target)
                     })?,
                 (miripbt_format::PrimitiveType::U32, Value::UNum(u)) =>
                     modify_value(this, target, |this, target| {
-                        this.write_scalar(Scalar::Int((u as u32).into()), &target)
+                        this.write_scalar(Scalar::from_u32(u as u32), &target)
                     })?,
                 (miripbt_format::PrimitiveType::U64, Value::UNum(u)) =>
                     modify_value(this, target, |this, target| {
-                        this.write_scalar(Scalar::Int((u as u64).into()), &target)
+                        this.write_scalar(Scalar::from_u64(u as u64), &target)
                     })?,
                 (miripbt_format::PrimitiveType::U128, Value::UNum(u)) =>
                     modify_value(this, target, |this, target| {
-                        this.write_scalar(Scalar::Int((u as u128).into()), &target)
+                        this.write_scalar(Scalar::from_u128(u), &target)
                     })?,
 
                 (miripbt_format::PrimitiveType::F16, Value::Float(_)) => todo!(),
@@ -166,9 +166,22 @@ fn update_single_value<'tcx>(
                 (miripbt_format::PrimitiveType::F64, Value::Float(_)) => todo!(),
                 (miripbt_format::PrimitiveType::F128, Value::Float(_)) => todo!(),
 
-                (miripbt_format::PrimitiveType::Str, Value::String(_s)) => todo!(),
+                (miripbt_format::PrimitiveType::Str, Value::String(s)) => {
+                    modify_value(this, target, |this, target| {
+                        let cs = size_of::<char>();
+                        let len = (target.len(this)? as usize).saturating_mul(cs);
+                        let mut bytes = s.as_bytes().to_vec();
+                        let ptr = target.ptr();
+                        bytes.resize(len, 0x41);
+                        this.write_bytes_ptr(ptr, bytes)
+                    })?;
+                }
 
-                (miripbt_format::PrimitiveType::Char, Value::Char(_)) => todo!(),
+                (miripbt_format::PrimitiveType::Char, Value::Char(c)) => {
+                    modify_value(this, target, |this, target| {
+                        this.write_scalar(Scalar::from_char(c), &target)
+                    })?;
+                }
 
                 (miripbt_format::PrimitiveType::Unit, Value::Unit) => {}
                 _ => unreachable!(),
@@ -176,9 +189,7 @@ fn update_single_value<'tcx>(
         miripbt_format::TypeRefType::Struct(s) =>
             if let Some(t) = pbt.format.find_type(s).cloned() {
                 let Value::Map(mut m) = body else { return Ok(()) };
-                println!("got values");
                 for (name, arg) in &t.fields {
-                    println!("{name}");
                     let mut target = this.project_field_named(&target, name)?;
                     match arg.kind {
                         miripbt_format::TypeRefKind::Value | miripbt_format::TypeRefKind::Other => {
@@ -196,6 +207,7 @@ fn update_single_value<'tcx>(
                     update_single_value(this, target, arg, body, pbt)?;
                 }
             },
+        miripbt_format::TypeRefType::Array { .. } => {}
     }
     Ok(())
 }

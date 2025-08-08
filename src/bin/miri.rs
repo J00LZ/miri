@@ -52,6 +52,7 @@ struct MiriCompilerCalls {
 
 impl rustc_driver::Callbacks for MiriCompilerCalls {
     fn config(&mut self, config: &mut Config) {
+        config.crate_cfg.push("miripbt".to_string());
         config.override_queries = Some(|_, providers| {
             providers.extern_queries.used_crate_source = |tcx, cnum| {
                 let mut providers = Providers::default();

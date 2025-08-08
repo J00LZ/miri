@@ -6,6 +6,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::TypeRefKind;
+
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
 pub struct Communication<T> {
     pub id: u32,
@@ -15,22 +17,41 @@ pub struct Communication<T> {
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
 pub enum RequestBody {
     Init(super::MiriPBTFormat),
-    Request(super::TypeRefType),
-    ReRequest(super::TypeRefType, Value, bool),
+    /// The string must be one of the functions defined in [`crate::MiriPBTFormat`].
+    Request(String, PBTType),
+    /// The string must be one of the functions defined in [`crate::MiriPBTFormat`]. The bool specifies if it worked or not.
+    ReRequest(String, PBTResult, PBTType),
     End,
 }
 
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
-pub enum ResponseBody {
-    Ok,
-    NoMoreFormats,
-    Data(Value),
-    Error(String),
+pub enum PBTResult {
+    Success,
+    Failure,
+    OtherError,
 }
 
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
+pub enum PBTType {
+    Values,
+    Mutability,
+}
+
+#[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
+pub enum ResponseBody {
+    Ok,
+    NoMoreFormats,
+    /// A hashmap of parameter names to values of these parameters.
+    Data(HashMap<String, Value>),
+    Mutability(HashMap<String, Mutability>),
+    Error(String),
+}
+
+#[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
 pub enum Value {
     Map(HashMap<String, Value>),
+    Vec(Vec<Value>),
+    Array(Vec<Value>),
     String(String),
     Char(char),
     Bool(bool),
@@ -38,6 +59,33 @@ pub enum Value {
     INum(i128),
     Float(f64),
     Unit,
+    Never,
+}
+
+#[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
+pub struct Mutability {
+    pub mutable: MutabilityKind,
+    pub children: HashMap<String, Mutability>,
+}
+
+#[derive(Debug, PartialEq, Deserialize, Serialize, Clone)]
+pub enum MutabilityKind {
+    Immutable,
+    Mutable,
+    Value,
+}
+
+impl From<TypeRefKind> for MutabilityKind {
+    fn from(value: TypeRefKind) -> Self {
+        match value {
+            TypeRefKind::Value => Self::Value,
+            TypeRefKind::Ref => Self::Immutable,
+            TypeRefKind::RefMut => Self::Mutable,
+            TypeRefKind::Ptr => Self::Immutable,
+            TypeRefKind::PtrMut => Self::Mutable,
+            TypeRefKind::Other => Self::Value,
+        }
+    }
 }
 
 pub struct Server {
@@ -56,7 +104,13 @@ impl Server {
     pub fn with_client(self) -> Self {
         if let Ok((stream, _)) = self.listener.accept() {
             println!("Client connected");
-            Self { listener: self.listener, c: Some(Client { l: stream, buffer: String::new() }) }
+            Self {
+                listener: self.listener,
+                c: Some(Client {
+                    l: stream,
+                    buffer: String::new(),
+                }),
+            }
         } else {
             panic!("Failed to accept client connection");
         }
@@ -77,7 +131,10 @@ impl Client {
         let stream =
             TcpStream::connect(format!("127.0.0.1:{}", addr)).expect("Failed to connect to server");
         println!("Connected to server at port {}", addr);
-        Self { l: stream, buffer: String::new() }
+        Self {
+            l: stream,
+            buffer: String::new(),
+        }
     }
 
     pub fn send<T: Serialize>(&mut self, data: &Communication<T>) -> std::io::Result<()> {
@@ -97,7 +154,8 @@ impl Client {
             if bytes_read == 0 {
                 break; // EOF
             }
-            self.buffer.push_str(&String::from_utf8_lossy(&temp_buffer[..bytes_read]));
+            self.buffer
+                .push_str(&String::from_utf8_lossy(&temp_buffer[..bytes_read]));
             if let Some((end, _)) = self.buffer.match_indices("\r\n").next() {
                 own_buffer.push_str(&self.buffer[..end]);
                 self.buffer.drain(..end + 2); // Remove the processed part including \r\n

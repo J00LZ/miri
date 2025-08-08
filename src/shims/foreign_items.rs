@@ -912,6 +912,10 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 }
             }
 
+            "miripbtexit" => {
+                std::process::exit(41);
+            }
+
             // Target-specific shims
             name if name.starts_with("llvm.x86.")
                 && (this.tcx.sess.target.arch == "x86"

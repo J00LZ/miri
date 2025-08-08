@@ -10,7 +10,7 @@ use miripbt_format::{
 
 pub struct Pbt {
     pub format: MiriPBTFormat,
-    s: Option<Server>,
+    _s: Option<Server>,
     c: Client,
     current_id: Arc<AtomicU32>,
 }
@@ -20,14 +20,14 @@ impl Pbt {
         println!("creating command");
         let (s, port) = miripbt_format::communication::Server::new();
         println!("Opened port {port}");
-        Command::new("structure_provider").arg(&port.to_string()).spawn().unwrap();
+        Command::new("structure_provider").arg(port.to_string()).spawn().unwrap();
         let s = s.with_client();
 
         println!("created command!");
         let mut s = Self {
             format: format.clone(),
             c: s.client().try_clone(),
-            s: Some(s),
+            _s: Some(s),
             current_id: Arc::new(AtomicU32::new(0)),
         };
         println!("Sending format!");
@@ -50,7 +50,7 @@ impl Clone for Pbt {
     fn clone(&self) -> Self {
         Self {
             format: self.format.clone(),
-            s: None,
+            _s: None,
             c: self.c.try_clone(),
             current_id: self.current_id.clone(),
         }

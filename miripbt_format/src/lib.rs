@@ -1,11 +1,9 @@
-use std::{
-    collections::HashMap,
-    ops::{RangeInclusive},
-};
+use std::{collections::HashMap, ops::RangeInclusive};
 
 use serde::{Deserialize, Serialize};
 
 pub mod communication;
+pub mod test;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +34,10 @@ impl MiriPBTFormat {
     pub fn find_type(&self, ref_name: &str) -> Option<&Type> {
         self.types.iter().find(|t| t.name == ref_name)
     }
+
+    pub fn find_function(&self, name: &str) -> Option<&Function> {
+        self.functions.iter().find(|f| f.name == name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,7 +62,16 @@ pub struct TypeRef {
     pub kind: TypeRefKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Default for TypeRef {
+    fn default() -> Self {
+        Self {
+            type_ref: TypeRefType::Primitive(PrimitiveType::Unit),
+            kind: TypeRefKind::Value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeRefKind {
     Value,
@@ -76,6 +87,17 @@ pub enum TypeRefKind {
 pub enum TypeRefType {
     Primitive(PrimitiveType),
     Struct(String),
+    Array {
+        array_type: ArrayType,
+        element_type: Box<TypeRefType>,
+        length: Option<usize>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArrayType {
+    Vec,
+    Array,
 }
 
 impl Default for TypeRefType {
@@ -84,7 +106,7 @@ impl Default for TypeRefType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrimitiveType {
     Bool,
@@ -107,6 +129,7 @@ pub enum PrimitiveType {
     Str,
     Char,
     Unit,
+    Never,
 }
 
 impl PrimitiveType {
