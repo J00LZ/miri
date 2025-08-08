@@ -16,7 +16,7 @@ use rustc_const_eval::interpret::{
 use rustc_middle::{throw_ub, throw_unsup};
 
 use crate::{
-    helpers::EvalContextExt, pbt::Pbt, AllocExtra, InterpCx, InterpResult, MiriInterpCxExt,
+    helpers::EvalContextExt, pbt::Pbt, InterpCx, InterpResult, MiriInterpCxExt,
     MiriMachine, OpTy, Scalar,
 };
 
