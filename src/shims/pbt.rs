@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use miripbt_format::{
     communication::{ResponseBody, Value},
@@ -8,11 +8,16 @@ use nix::{
     sys::wait::{waitpid, WaitStatus},
     unistd::ForkResult,
 };
-use rustc_const_eval::interpret::{MPlaceTy, Projectable};
+use rustc_ast::Mutability;
+use rustc_const_eval::interpret::{
+    AllocId, AllocMap, Allocation, CheckInAllocMsg, GlobalAlloc, MPlaceTy, Machine, MemoryKind,
+    Projectable,
+};
+use rustc_middle::{throw_ub, throw_unsup};
 
 use crate::{
-    helpers::EvalContextExt, pbt::Pbt, InterpCx, InterpResult, MiriInterpCxExt, MiriMachine, OpTy,
-    Scalar,
+    helpers::EvalContextExt, pbt::Pbt, AllocExtra, InterpCx, InterpResult, MiriInterpCxExt,
+    MiriMachine, OpTy, Scalar,
 };
 
 pub trait PbtEvalCtx<'tcx>: MiriInterpCxExt<'tcx> {
@@ -49,6 +54,7 @@ pub trait PbtEvalCtx<'tcx>: MiriInterpCxExt<'tcx> {
                         let actual_arg = &args[*idx as usize];
                         let body = body.get(arg_name).cloned().unwrap_or(Value::Unit);
                         let mut target = this.deref_pointer(actual_arg)?;
+
                         match arg.kind {
                             miripbt_format::TypeRefKind::Value
                             | miripbt_format::TypeRefKind::Other => {}
@@ -168,12 +174,12 @@ fn update_single_value<'tcx>(
 
                 (miripbt_format::PrimitiveType::Str, Value::String(s)) => {
                     modify_value(this, target, |this, target| {
-                        let cs = size_of::<char>();
-                        let len = (target.len(this)? as usize).saturating_mul(cs);
+                        let len = target.len(this)? as usize;
                         let mut bytes = s.as_bytes().to_vec();
                         let ptr = target.ptr();
                         bytes.resize(len, 0x41);
-                        this.write_bytes_ptr(ptr, bytes)
+                        this.write_bytes_ptr(ptr, bytes)?;
+                        Ok(())
                     })?;
                 }
 
@@ -184,6 +190,7 @@ fn update_single_value<'tcx>(
                 }
 
                 (miripbt_format::PrimitiveType::Unit, Value::Unit) => {}
+                (miripbt_format::PrimitiveType::Never, Value::Never) => {}
                 _ => unreachable!(),
             },
         miripbt_format::TypeRefType::Struct(s) =>
@@ -222,14 +229,105 @@ fn modify_value<'tcx, R>(
 ) -> InterpResult<'tcx, R> {
     let (id, _, _) = this.ptr_get_alloc_id(dest.ptr())?;
     let bt;
+    let m_bt;
+    let old_mutability;
     {
-        let (extra, _) = this.get_alloc_extra_mut(id)?;
+        let extra = get_alloc_raw_mut(this, id)?;
+        old_mutability = extra.mutability;
+        extra.mutability = Mutability::Mut;
+        let extra = &mut extra.extra;
         bt = extra.borrow_tracker.take();
+        m_bt = this.machine.borrow_tracker.take();
     }
     let res = set_value(this, dest)?;
     {
-        let (extra, _) = this.get_alloc_extra_mut(id)?;
+        let extra = get_alloc_raw_mut(this, id)?;
+        extra.mutability = old_mutability;
+        let extra = &mut extra.extra;
         extra.borrow_tracker = bt;
+        this.machine.borrow_tracker = m_bt;
     }
     Ok(res)
+}
+
+// all below are borrowed from `memory.rs` in `rustc_const_eval`, I need to be able to force the mutability of an allocation
+fn get_alloc_raw_mut<'a, 'tcx, M: Machine<'tcx>>(
+    this: &'a mut InterpCx<'tcx, M>,
+    id: AllocId,
+) -> InterpResult<'tcx, &'a mut Allocation<M::Provenance, M::AllocExtra, M::Bytes>> {
+    // We have "NLL problem case #3" here, which cannot be worked around without loss of
+    // efficiency even for the common case where the key is in the map.
+    // <https://rust-lang.github.io/rfcs/2094-nll.html#problem-case-3-conditional-control-flow-across-functions>
+    // (Cannot use `get_mut_or` since `get_global_alloc` needs `&self`.)
+    if amap(this).get_mut(id).is_none() {
+        // Slow path.
+        // Allocation not found locally, go look global.
+        let alloc = get_global_alloc(this, id, /*is_write*/ false)?;
+        let kind = M::GLOBAL_KIND.expect(
+            "I got a global allocation that I have to copy but the machine does \
+                    not expect that to happen",
+        );
+        amap(this).insert(id, (MemoryKind::Machine(kind), alloc.into_owned()));
+    }
+
+    let (_kind, alloc) = amap(this).get_mut(id).unwrap();
+    // if alloc.mutability.is_not() {
+    //     throw_ub!(WriteToReadOnly(id))
+    // }
+    Ok(alloc)
+}
+
+#[allow(mutable_transmutes, clippy::mut_from_ref)]
+fn amap<'a, 'tcx, M: Machine<'tcx>>(this: &'a InterpCx<'tcx, M>) -> &'a mut M::MemoryMap {
+    let map = this.memory.alloc_map();
+    // very safe transmute
+    unsafe { std::mem::transmute::<&M::MemoryMap, &mut M::MemoryMap>(map) }
+}
+
+fn get_global_alloc<'a, 'tcx, M: Machine<'tcx>>(
+    this: &'a InterpCx<'tcx, M>,
+    id: AllocId,
+    is_write: bool,
+) -> InterpResult<'tcx, Cow<'tcx, Allocation<M::Provenance, M::AllocExtra, M::Bytes>>> {
+    let (alloc, def_id) = match this.tcx.try_get_global_alloc(id) {
+        Some(GlobalAlloc::Memory(mem)) => {
+            // Memory of a constant or promoted or anonymous memory referenced by a static.
+            (mem, None)
+        }
+        Some(GlobalAlloc::Function(..)) => throw_ub!(DerefFunctionPointer(id)),
+        Some(GlobalAlloc::VTable(..)) => throw_ub!(DerefVTablePointer(id)),
+        None => throw_ub!(PointerUseAfterFree(id, CheckInAllocMsg::MemoryAccessTest)),
+        Some(GlobalAlloc::Static(def_id)) => {
+            assert!(this.tcx.is_static(def_id));
+            // Thread-local statics do not have a constant address. They *must* be accessed via
+            // `ThreadLocalRef`; we can never have a pointer to them as a regular constant value.
+            assert!(!this.tcx.is_thread_local_static(def_id));
+            // Notice that every static has two `AllocId` that will resolve to the same
+            // thing here: one maps to `GlobalAlloc::Static`, this is the "lazy" ID,
+            // and the other one is maps to `GlobalAlloc::Memory`, this is returned by
+            // `eval_static_initializer` and it is the "resolved" ID.
+            // The resolved ID is never used by the interpreted program, it is hidden.
+            // This is relied upon for soundness of const-patterns; a pointer to the resolved
+            // ID would "sidestep" the checks that make sure consts do not point to statics!
+            // The `GlobalAlloc::Memory` branch here is still reachable though; when a static
+            // contains a reference to memory that was created during its evaluation (i.e., not
+            // to another static), those inner references only exist in "resolved" form.
+            if this.tcx.is_foreign_item(def_id) {
+                // This is unreachable in Miri, but can happen in CTFE where we actually *do* support
+                // referencing arbitrary (declared) extern statics.
+                throw_unsup!(ExternStatic(def_id));
+            }
+
+            // We don't give a span -- statics don't need that, they cannot be generic or associated.
+            let val = this.ctfe_query(|tcx| tcx.eval_static_initializer(def_id))?;
+            (val, Some(def_id))
+        }
+    };
+    M::before_access_global(this.tcx, &this.machine, id, alloc, def_id, is_write)?;
+    // We got tcx memory. Let the machine initialize its "extra" stuff.
+    M::adjust_global_allocation(
+        this,
+        id, // always use the ID we got as input, not the "hidden" one.
+        alloc.inner(),
+    )
 }

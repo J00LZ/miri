@@ -1,9 +1,6 @@
 fn main() {
-    let mut b = 10;
-    let mut f = Foo { a: 20, b: &mut b };
-    foo(&mut f, 42);
-    let c = 10;
-    foo_simple(&c);
+    let x = "memes";
+    test(x);
 }
 
 fn foo_simple(x: &i32) {
@@ -49,4 +46,37 @@ fn foo(f: &mut Foo, x: i32) -> i32 {
     // This function is marked with the `miripbt` marker.
     // It will be processed by the miripbt tool.
     f.a + unsafe { *f.b } + x
+}
+
+#[cfg(not(miripbt))]
+#[cfg_attr(miripbt_gen, miripbt::tool)]
+fn test(foo: &str) {
+    println!("test: {}", foo);
+}
+#[cfg(miripbt)]
+fn test(foo: &str) {
+    #[cfg(not(miripbt))]
+    unsafe extern "Rust" {
+        fn miripbt_test(names: &[&str], foo: &&str);
+
+        fn miripbtexit();
+
+    }
+    #[cfg(miripbt)]
+    extern "Rust" {
+        fn miripbt_test(names: &[&str], foo: &&str);
+
+        fn miripbtexit();
+
+    }
+    unsafe {
+        miripbt_test(&["foo"], &foo);
+    }
+    let res = {
+        println!("test: {}", foo);
+    };
+    unsafe {
+        miripbtexit();
+    }
+    res
 }
