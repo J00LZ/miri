@@ -631,7 +631,7 @@ impl<'tcx> MiriMachine<'tcx> {
             if tcx.pointer_size().bits() < 32 { page_size * 4 } else { page_size * 16 };
         MiriMachine {
             tcx,
-            pbt: config.pbt_info_file.as_ref().map(pbt::Pbt::new),
+            pbt: config.pbt_info_file.as_ref().map(|p| pbt::Pbt::new(p, config.stop_pbt_after_first)),
             borrow_tracker,
             data_race,
             alloc_addresses: RefCell::new(alloc_addresses::GlobalStateInner::new(config, stack_addr)),

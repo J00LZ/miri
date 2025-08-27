@@ -13,10 +13,11 @@ pub struct Pbt {
     _s: Option<Server>,
     c: Client,
     current_id: Arc<AtomicU32>,
+    pub stop_after_first: bool,
 }
 
 impl Pbt {
-    pub fn new(format: &MiriPBTFormat) -> Self {
+    pub fn new(format: &MiriPBTFormat, stop_after_first: bool) -> Self {
         println!("creating command");
         let (s, port) = miripbt_format::communication::Server::new();
         println!("Opened port {port}");
@@ -29,6 +30,7 @@ impl Pbt {
             c: s.client().try_clone(),
             _s: Some(s),
             current_id: Arc::new(AtomicU32::new(0)),
+            stop_after_first,
         };
         println!("Sending format!");
         // Send the format to the structure provider.
@@ -53,6 +55,7 @@ impl Clone for Pbt {
             _s: None,
             c: self.c.try_clone(),
             current_id: self.current_id.clone(),
+            stop_after_first: self.stop_after_first,
         }
     }
 }

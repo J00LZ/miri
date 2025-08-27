@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, str::FromStr};
 
 use miripbt_format::{
     communication::{ResponseBody, Value},
@@ -8,35 +8,38 @@ use nix::{
     sys::wait::{waitpid, WaitStatus},
     unistd::ForkResult,
 };
+use rustc_apfloat::ieee::{Double, Single};
 use rustc_ast::Mutability;
 use rustc_const_eval::interpret::{
     AllocId, AllocMap, Allocation, CheckInAllocMsg, GlobalAlloc, MPlaceTy, Machine, MemoryKind,
     Projectable,
 };
 use rustc_middle::{throw_ub, throw_unsup};
+use rustc_target::abi::VariantIdx;
 
 use crate::{
-    helpers::EvalContextExt, pbt::Pbt, InterpCx, InterpResult, MiriInterpCxExt,
-    MiriMachine, OpTy, Scalar,
+    helpers::EvalContextExt, pbt::Pbt, InterpCx, InterpResult, MiriInterpCxExt, MiriMachine, OpTy,
+    Scalar,
 };
 
 pub trait PbtEvalCtx<'tcx>: MiriInterpCxExt<'tcx> {
     fn run_pbt(&mut self, func_name: &str, args: &[OpTy<'tcx>]) -> InterpResult<'tcx> {
+        println!("running for {}", func_name);
         let this = self.eval_context_mut();
         if let Some(mut pbt) = { this.machine.pbt.as_ref().cloned() } {
+            print!("we have pbt data, and the following functions: ");
+            for f in &pbt.format.functions {
+                print!("{} ", f.name);
+            }
+            println!();
+
             if let Some(f) = pbt.format.functions.iter().find(|f| f.name == func_name).cloned() {
                 println!("found function {}", f.name);
-
-                let array = this.deref_pointer(&args[0])?;
-                let mut array = this.project_array_fields(&array)?;
-                let mut elements = HashMap::new();
-                while let Ok(Some((a, b))) = array.next(this) {
-                    let d = this.deref_pointer(&b)?;
-                    let s = this.read_str(&d)?.to_owned();
-                    if let Some(tr) = f.args.get(&s) {
-                        elements.insert(s, (a + 1, tr));
-                    }
+                if f.args.is_empty() {
+                    return Ok(());
                 }
+
+                let elements = modify_args(this, args, &f)?;
 
                 let mut res = HashMap::<i32, i32>::new();
                 let mut is_main = true;
@@ -72,11 +75,19 @@ pub trait PbtEvalCtx<'tcx>: MiriInterpCxExt<'tcx> {
                         Ok(ForkResult::Parent { child }) => {
                             let WaitStatus::Exited(_pid, code) = waitpid(child, None).unwrap()
                             else {
-                                panic!("Wait failed!!!")
+                                let e = res.entry(-41).or_default();
+                                *e = e.saturating_add(1);
+                                continue;
                             };
                             println!("Recieved code {code}!");
                             let e = res.entry(code).or_default();
                             *e = e.saturating_add(1);
+                            // if code == 41 {
+                                if pbt.stop_after_first && code == 41 {
+                                    break;
+                                }
+                                // run_mutability(this, func_name, &elements, args, &mut pbt)?;
+                            // }
                         }
                         Ok(ForkResult::Child) => {
                             is_main = false;
@@ -100,8 +111,127 @@ pub trait PbtEvalCtx<'tcx>: MiriInterpCxExt<'tcx> {
     }
 }
 
+fn modify_args<'tcx, 'f>(
+    this: &InterpCx<'tcx, MiriMachine<'tcx>>,
+    args: &[OpTy<'tcx>],
+    f: &'f miripbt_format::Function,
+) -> InterpResult<'tcx, HashMap<String, (u64, &'f TypeRef)>> {
+    let array = this.deref_pointer(&args[0])?;
+    let mut array = this.project_array_fields(&array)?;
+    let mut elements = HashMap::new();
+    while let Ok(Some((a, b))) = array.next(this) {
+        let d = this.deref_pointer(&b)?;
+        let s = this.read_str(&d)?.to_owned();
+        if let Some(tr) = f.args.get(&s) {
+            elements.insert(s, (a.saturating_add(1), tr));
+        }
+    }
+
+    Ok(elements)
+}
+
+fn run_mutability<'tcx>(
+    this: &mut InterpCx<'tcx, MiriMachine<'tcx>>,
+    func_name: &str,
+    elements: &HashMap<String, (u64, &TypeRef)>,
+    args: &[OpTy<'tcx>],
+    pbt: &mut Pbt,
+) -> InterpResult<'tcx> {
+    let ResponseBody::Mutability(body) =
+        pbt.write(miripbt_format::communication::RequestBody::Request(
+            func_name.to_string(),
+            miripbt_format::communication::PBTType::Mutability,
+        ))
+    else {
+        return Ok(());
+    };
+    for (arg_name, (idx, arg)) in elements {
+        #[allow(clippy::cast_possible_truncation)]
+        let actual_arg = &args[*idx as usize];
+        if let Some(body) = body.get(arg_name).cloned() {
+            let mut target = this.deref_pointer(actual_arg)?;
+
+            match arg.kind {
+                miripbt_format::TypeRefKind::Value | miripbt_format::TypeRefKind::Other => {}
+                miripbt_format::TypeRefKind::Ref
+                | miripbt_format::TypeRefKind::RefMut
+                | miripbt_format::TypeRefKind::Ptr
+                | miripbt_format::TypeRefKind::PtrMut => {
+                    target = this.deref_pointer(&target)?;
+                }
+            }
+
+            set_mutability(this, target, arg, body, pbt)?;
+        }
+    }
+    Ok(())
+}
+
 impl<'tcx> PbtEvalCtx<'tcx> for crate::MiriInterpCx<'tcx> {}
 
+fn set_mutability<'tcx>(
+    this: &mut InterpCx<'tcx, MiriMachine<'tcx>>,
+    target: MPlaceTy<'tcx, crate::machine::Provenance>,
+    arg: &TypeRef,
+    mut body: miripbt_format::communication::Mutability,
+    pbt: &mut Pbt,
+) -> InterpResult<'tcx> {
+    {
+        set_mutability_once(this, &target, body.mutable)?;
+    }
+    match &arg.type_ref {
+        miripbt_format::TypeRefType::Primitive(_) => {
+            // no recursion needed on primitive, it's already a value in there...
+        }
+        miripbt_format::TypeRefType::Type(t) => {
+            if let Some(typ) = pbt.format.find_type(t).cloned() {
+                match typ {
+                    miripbt_format::Type::Struct(s) =>
+                        for (name, arg) in &s.fields {
+                            let mut target = this.project_field_named(&target, name)?;
+                            match arg.kind {
+                                miripbt_format::TypeRefKind::Value
+                                | miripbt_format::TypeRefKind::Other => {}
+                                miripbt_format::TypeRefKind::Ref
+                                | miripbt_format::TypeRefKind::RefMut
+                                | miripbt_format::TypeRefKind::Ptr
+                                | miripbt_format::TypeRefKind::PtrMut => {
+                                    target = this.deref_pointer(&target)?;
+                                }
+                            }
+                            let Some(body) = body.children.remove(name) else {
+                                continue;
+                            };
+                            set_mutability(this, target, arg, body, pbt)?;
+                        },
+                    miripbt_format::Type::Enum(_) => {
+                        // enum can only be unit type, so no recursion needed
+                    }
+                }
+            }
+        }
+        miripbt_format::TypeRefType::Array { array_type, element_type, length } => {}
+    }
+
+    Ok(())
+}
+
+fn set_mutability_once<'tcx>(
+    this: &mut InterpCx<'tcx, MiriMachine<'tcx>>,
+    dest: &MPlaceTy<'tcx, crate::machine::Provenance>,
+    set_value: miripbt_format::communication::MutabilityKind,
+) -> InterpResult<'tcx> {
+    let (id, _, _) = this.ptr_get_alloc_id(dest.ptr())?;
+    {
+        let extra = get_alloc_raw_mut(this, id)?;
+        extra.mutability = match set_value {
+            miripbt_format::communication::MutabilityKind::Immutable => Mutability::Not,
+            miripbt_format::communication::MutabilityKind::Mutable => Mutability::Mut,
+            miripbt_format::communication::MutabilityKind::Value => extra.mutability,
+        };
+    }
+    Ok(())
+}
 #[allow(clippy::cast_possible_truncation)]
 fn update_single_value<'tcx>(
     this: &mut InterpCx<'tcx, MiriMachine<'tcx>>,
@@ -168,20 +298,47 @@ fn update_single_value<'tcx>(
                     })?,
 
                 (miripbt_format::PrimitiveType::F16, Value::Float(_)) => todo!(),
-                (miripbt_format::PrimitiveType::F32, Value::Float(_)) => todo!(),
-                (miripbt_format::PrimitiveType::F64, Value::Float(_)) => todo!(),
+                (miripbt_format::PrimitiveType::F32, Value::Float(f)) =>
+                    modify_value(this, target, |this, target| {
+                        this.write_scalar(
+                            Scalar::from_f32(Single::from_str(&format!("{f}")).unwrap()),
+                            &target,
+                        )
+                    })?,
+                (miripbt_format::PrimitiveType::F64, Value::Float(f)) =>
+                    modify_value(this, target, |this, target| {
+                        this.write_scalar(
+                            Scalar::from_f64(Double::from_str(&format!("{f}")).unwrap()),
+                            &target,
+                        )
+                    })?,
                 (miripbt_format::PrimitiveType::F128, Value::Float(_)) => todo!(),
 
-                (miripbt_format::PrimitiveType::Str, Value::String(s)) => {
-                    modify_value(this, target, |this, target| {
-                        let len = target.len(this)? as usize;
-                        let mut bytes = s.as_bytes().to_vec();
-                        let ptr = target.ptr();
-                        bytes.resize(len, 0x41);
-                        this.write_bytes_ptr(ptr, bytes)?;
-                        Ok(())
-                    })?;
-                }
+                (miripbt_format::PrimitiveType::Str(string_type), Value::String(s)) =>
+                    match string_type {
+                        miripbt_format::StringType::Str => {
+                            modify_value(this, target, |this, target| {
+                                let len = target.len(this)? as usize;
+                                let mut bytes = s.as_bytes().to_vec();
+                                let ptr = target.ptr();
+                                bytes.resize(len, 0x41);
+                                this.write_bytes_ptr(ptr, bytes)?;
+                                Ok(())
+                            })?;
+                        }
+                        miripbt_format::StringType::String => {}
+                        miripbt_format::StringType::CStr => {
+                            modify_value(this, target, |this, target| {
+                                let ptr = target.ptr();
+                                let len = this.read_c_str(ptr)?.len().saturating_sub(1);
+                                let mut bytes = s.as_bytes().to_vec();
+                                bytes.resize(len, 0x41);
+                                this.write_c_str(&bytes, ptr, bytes.len() as u64)?;
+                                Ok(())
+                            })?;
+                        }
+                        miripbt_format::StringType::CString => {}
+                    },
 
                 (miripbt_format::PrimitiveType::Char, Value::Char(c)) => {
                     modify_value(this, target, |this, target| {
@@ -193,25 +350,36 @@ fn update_single_value<'tcx>(
                 (miripbt_format::PrimitiveType::Never, Value::Never) => {}
                 _ => unreachable!(),
             },
-        miripbt_format::TypeRefType::Struct(s) =>
+        miripbt_format::TypeRefType::Type(s) =>
             if let Some(t) = pbt.format.find_type(s).cloned() {
-                let Value::Map(mut m) = body else { return Ok(()) };
-                for (name, arg) in &t.fields {
-                    let mut target = this.project_field_named(&target, name)?;
-                    match arg.kind {
-                        miripbt_format::TypeRefKind::Value | miripbt_format::TypeRefKind::Other => {
-                        }
-                        miripbt_format::TypeRefKind::Ref
-                        | miripbt_format::TypeRefKind::RefMut
-                        | miripbt_format::TypeRefKind::Ptr
-                        | miripbt_format::TypeRefKind::PtrMut => {
-                            target = this.deref_pointer(&target)?;
+                match t {
+                    miripbt_format::Type::Struct(s) => {
+                        let Value::Map(mut m) = body else { return Ok(()) };
+                        for (name, arg) in &s.fields {
+                            let mut target = this.project_field_named(&target, name)?;
+                            match arg.kind {
+                                miripbt_format::TypeRefKind::Value
+                                | miripbt_format::TypeRefKind::Other => {}
+                                miripbt_format::TypeRefKind::Ref
+                                | miripbt_format::TypeRefKind::RefMut
+                                | miripbt_format::TypeRefKind::Ptr
+                                | miripbt_format::TypeRefKind::PtrMut => {
+                                    target = this.deref_pointer(&target)?;
+                                }
+                            }
+                            let Some(body) = m.remove(name) else {
+                                continue;
+                            };
+                            update_single_value(this, target, arg, body, pbt)?;
                         }
                     }
-                    let Some(body) = m.remove(name) else {
-                        continue;
-                    };
-                    update_single_value(this, target, arg, body, pbt)?;
+                    miripbt_format::Type::Enum(e) => {
+                        let Value::EnumVariant(m) = body else { return Ok(()) };
+                        let var = e.variants[&m];
+                        modify_value(this, target, |this, target| {
+                            this.write_discriminant(VariantIdx::from_u32(var), &target)
+                        })?;
+                    }
                 }
             },
         miripbt_format::TypeRefType::Array { .. } => {}

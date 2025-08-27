@@ -19,7 +19,11 @@ impl MiriPBTFormat {
 
     pub fn add_types(&mut self, ty: Vec<Type>) {
         for t in ty {
-            if !self.types.iter().any(|existing| existing.name == t.name) {
+            if !self
+                .types
+                .iter()
+                .any(|existing| existing.name() == t.name())
+            {
                 self.types.push(t);
             }
         }
@@ -32,7 +36,21 @@ impl MiriPBTFormat {
     }
 
     pub fn find_type(&self, ref_name: &str) -> Option<&Type> {
-        self.types.iter().find(|t| t.name == ref_name)
+        self.types.iter().find(|t| t.name() == ref_name)
+    }
+
+    pub fn find_struct(&self, ref_name: &str) -> Option<&Struct> {
+        self.find_type(ref_name).and_then(|t| match t {
+            Type::Struct(s) => Some(s),
+            _ => None,
+        })
+    }
+
+    pub fn find_enum(&self, ref_name: &str) -> Option<&Enum> {
+        self.find_type(ref_name).and_then(|t| match t {
+            Type::Enum(e) => Some(e),
+            _ => None,
+        })
     }
 
     pub fn find_function(&self, name: &str) -> Option<&Function> {
@@ -42,9 +60,45 @@ impl MiriPBTFormat {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct Type {
+pub struct Struct {
     pub name: String,
     pub fields: HashMap<String, TypeRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Enum {
+    pub name: String,
+    pub variants: HashMap<String, u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
+pub enum Type {
+    Struct(Struct),
+    Enum(Enum),
+}
+
+impl From<Struct> for Type {
+    fn from(s: Struct) -> Self {
+        Type::Struct(s)
+    }
+}
+
+impl From<Enum> for Type {
+    fn from(e: Enum) -> Self {
+        Type::Enum(e)
+    }
+}
+
+impl Type {
+    fn name(&self) -> &str {
+        match self {
+            Type::Struct(s) => s.name.as_str(),
+            Type::Enum(e) => e.name.as_str(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,7 +140,7 @@ pub enum TypeRefKind {
 #[serde(untagged)]
 pub enum TypeRefType {
     Primitive(PrimitiveType),
-    Struct(String),
+    Type(String),
     Array {
         array_type: ArrayType,
         element_type: Box<TypeRefType>,
@@ -126,10 +180,18 @@ pub enum PrimitiveType {
     F32,
     F64,
     F128,
-    Str,
+    Str(StringType),
     Char,
     Unit,
     Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StringType {
+    Str,
+    String,
+    CStr,
+    CString,
 }
 
 impl PrimitiveType {

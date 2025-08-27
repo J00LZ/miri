@@ -52,6 +52,7 @@ pub enum Value {
     Map(HashMap<String, Value>),
     Vec(Vec<Value>),
     Array(Vec<Value>),
+    EnumVariant(String),
     String(String),
     Char(char),
     Bool(bool),

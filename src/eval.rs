@@ -88,6 +88,8 @@ pub struct MiriConfig {
     pub validate: bool,
     /// File that contains the structures of all pbt annotated functions for miripbt.
     pub pbt_info_file: Option<miripbt_format::MiriPBTFormat>,
+    /// Stop PBT execution if an illegal write was found.
+    pub stop_pbt_after_first: bool,
     /// Determines if Stacked Borrows or Tree Borrows is enabled.
     pub borrow_tracker: Option<BorrowTrackerMethod>,
     /// Whether `core::ptr::Unique` receives special treatment.
@@ -166,6 +168,7 @@ impl Default for MiriConfig {
             env: vec![],
             validate: true,
             pbt_info_file: None,
+            stop_pbt_after_first: false,
             borrow_tracker: Some(BorrowTrackerMethod::StackedBorrows),
             unique_is_unique: false,
             check_alignment: AlignmentCheck::Int,

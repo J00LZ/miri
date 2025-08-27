@@ -407,7 +407,7 @@ pub fn report_error<'tcx>(
     report_msg(
         DiagLevel::Error,
         if let Some(title) = title { format!("{title}: {}", msg[0]) } else { msg[0].clone() },
-        msg,
+        msg.clone(),
         vec![],
         helps,
         &stacktrace,
@@ -453,7 +453,13 @@ pub fn report_error<'tcx>(
             trace!("    local {}: {:?}", i, local);
         }
     }
-
+    if title == Some("Undefined Behavior")
+        && msg.iter().any(|s| {
+            s.contains("attempting a write access using") || s.contains("which is read-only")
+        })
+    {
+        return Some((41, false));
+    }
     None
 }
 

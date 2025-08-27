@@ -428,11 +428,13 @@ fn main() {
             match std::fs::File::open(param) {
                 Ok(f) => {
                     miri_config.pbt_info_file = serde_json::from_reader(f).ok();
-                },
+                }
                 Err(err) => {
                     eprintln!("Error opening PBT info file `{param}`: {err}");
-                },
+                }
             }
+        } else if arg == "-Zmiri-pbt-stop-first" {
+            miri_config.stop_pbt_after_first = true;
         } else if arg == "-Zmiri-disable-stacked-borrows" {
             miri_config.borrow_tracker = None;
         } else if arg == "-Zmiri-tree-borrows" {

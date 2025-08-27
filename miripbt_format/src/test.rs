@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use checkito::{Generate, Shrink};
 
-use crate::{communication::Mutability, Function, MiriPBTFormat, TypeRefType};
+use crate::{communication::Mutability, Function, MiriPBTFormat, Type, TypeRefType};
 
 pub struct MutabilityGenerator {
     format: MiriPBTFormat,
@@ -53,8 +53,8 @@ impl MutabilityGenerator {
 fn mutability_children(t: &TypeRefType, format: &MiriPBTFormat) -> HashMap<String, Mutability> {
     match t {
         TypeRefType::Primitive(_) => HashMap::new(),
-        TypeRefType::Struct(name) => {
-            if let Some(s) = format.find_type(name) {
+        TypeRefType::Type(name) => {
+            if let Some(Type::Struct(s)) = format.find_type(name) {
                 s.fields
                     .iter()
                     .map(|(k, v)| {

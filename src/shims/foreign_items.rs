@@ -913,7 +913,7 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
 
             "miripbtexit" => {
-                std::process::exit(41);
+                std::process::exit(0);
             }
 
             // Target-specific shims
