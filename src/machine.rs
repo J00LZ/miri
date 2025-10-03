@@ -1219,7 +1219,9 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         if let Some(data_race) = &alloc_extra.data_race {
             data_race.read(alloc_id, range, NaReadType::Read, None, machine)?;
         }
-        if let Some(borrow_tracker) = &alloc_extra.borrow_tracker {
+        if let Some(borrow_tracker) = &alloc_extra.borrow_tracker
+            && machine.borrow_tracker.is_some()
+        {
             borrow_tracker.before_memory_read(alloc_id, prov_extra, range, machine)?;
         }
         if let Some(weak_memory) = &alloc_extra.weak_memory {
@@ -1243,7 +1245,9 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         if let Some(data_race) = &mut alloc_extra.data_race {
             data_race.write(alloc_id, range, NaWriteType::Write, None, machine)?;
         }
-        if let Some(borrow_tracker) = &mut alloc_extra.borrow_tracker {
+        if let Some(borrow_tracker) = &mut alloc_extra.borrow_tracker
+            && machine.borrow_tracker.is_some()
+        {
             borrow_tracker.before_memory_write(alloc_id, prov_extra, range, machine)?;
         }
         if let Some(weak_memory) = &alloc_extra.weak_memory {
@@ -1274,7 +1278,9 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
                 machine,
             )?;
         }
-        if let Some(borrow_tracker) = &mut alloc_extra.borrow_tracker {
+        if let Some(borrow_tracker) = &mut alloc_extra.borrow_tracker
+            && machine.borrow_tracker.is_some()
+        {
             borrow_tracker.before_memory_deallocation(alloc_id, prove_extra, size, machine)?;
         }
         if let Some((_, deallocated_at)) = machine.allocation_spans.borrow_mut().get_mut(&alloc_id)

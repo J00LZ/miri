@@ -1,6 +1,9 @@
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     process::Command,
-    sync::{atomic::AtomicU32, Arc},
+    rc::Rc,
+    sync::{atomic::{AtomicBool, AtomicU32}, Arc},
 };
 
 use miripbt_format::{
@@ -14,6 +17,8 @@ pub struct Pbt {
     c: Client,
     current_id: Arc<AtomicU32>,
     pub stop_after_first: bool,
+    pub has_failed: AtomicBool,
+    func_values: Rc<RefCell<HashMap<String, miripbt_format::communication::Value>>>,
 }
 
 impl Pbt {
@@ -31,6 +36,8 @@ impl Pbt {
             _s: Some(s),
             current_id: Arc::new(AtomicU32::new(0)),
             stop_after_first,
+            has_failed: AtomicBool::new(false),
+            func_values: Rc::new(RefCell::new(HashMap::new())),
         };
         println!("Sending format!");
         // Send the format to the structure provider.
@@ -46,6 +53,24 @@ impl Pbt {
         self.c.send(&msg).expect("Failed to send data to structure provider");
         self.c.receive().ok().map(|it| it.data).unwrap()
     }
+
+    pub fn set_prev(&self, name: impl ToString, value: miripbt_format::communication::Value) {
+        self.func_values.borrow_mut().insert(name.to_string(), value);
+    }
+
+    /// returns true if they are the same, false if they are not
+    pub fn are_equal(
+        &self,
+        name: &str,
+        other: miripbt_format::communication::Value,
+    ) -> Result<Vec<String>, String> {
+        let current = self.func_values.borrow();
+        if let Some(current) = current.get(name) {
+            self.format.compare(name, current, &other)
+        } else {
+            Ok(vec![])
+        }
+    }
 }
 
 impl Clone for Pbt {
@@ -56,6 +81,8 @@ impl Clone for Pbt {
             c: self.c.try_clone(),
             current_id: self.current_id.clone(),
             stop_after_first: self.stop_after_first,
+            has_failed: AtomicBool::new(self.has_failed.load(std::sync::atomic::Ordering::SeqCst)),
+            func_values: self.func_values.clone(),
         }
     }
 }

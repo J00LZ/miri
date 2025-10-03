@@ -912,6 +912,13 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 }
             }
 
+            x if x.starts_with("miripbtexit_") => {
+                this.check_abi_and_shim_symbol_clash(abi, Abi::Rust, link_name)?;
+                if let Some(actual_name) = x.strip_prefix("miripbtexit_") {
+                    shims::pbt::PbtEvalCtx::run_pbt_exit(this, actual_name, args)?;
+                }
+            }
+
             "miripbtexit" => {
                 std::process::exit(0);
             }
